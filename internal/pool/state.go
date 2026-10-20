@@ -20,38 +20,54 @@ func (p *Pool) Disable(uid, reason string) {
 	}
 }
 
-// NoteSessionDead 记录一次 ErrSessionDead（12153）——**不立即禁用**。
-// 旧行为一次 12153 即 Disable，但 12153 会被临时性触发（网络抖动/上游闪断/refresh
-// 竞态），一次失败就永久杀号会误杀健康账号（P0-1 侦察：13 个 disabled 号全部 refresh
-// 成功，是历史误判的受害者）。改为连续 sessionDeadThreshold 次才禁用：
-// 计数 +1，达到阈值 → Disable（reason=12153 session dead）并清计数；
-// refresh 成功 / 任意成功 / 手工复活 → ClearSessionDead 清计数。
-// 返回 true 表示本次已达阈值并完成禁用。
-// 即使账号已 disabled，计数仍累计并返回 false 前 N-1 次——但 keepalive 会跳过
-// disabled 号，实际只有「已 disabled 后复活且计数未清」这类场景才会走到这里。
+// NoteSessionDead 记录 12153：前两次冷却 60s，连续第三次才禁用。
+// chat/refresh 共用此计数，成功或手动复活清零。
 func (p *Pool) NoteSessionDead(uid string) bool {
+	return p.noteCredentialFailure(uid, false)
+}
+
+// NoteRequestIllegal 只处理 11140 的 request illegal 变体：前两次冷却 30min，
+// 连续第三次禁用；模型限流和 14017 不进入这里。
+func (p *Pool) NoteRequestIllegal(uid string) bool {
+	return p.noteCredentialFailure(uid, true)
+}
+
+func (p *Pool) noteCredentialFailure(uid string, illegal bool) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
-	if !ok {
+	if !ok || e.disabled {
 		return false
 	}
-	e.sessionDeadFails++
-	if e.sessionDeadFails < sessionDeadThreshold {
-		return false
+	count, cooldown, reason := &e.sessionDeadFails, time.Minute, sessionDeadReason
+	if illegal {
+		count, cooldown, reason = &e.requestIllegalFails, 30*time.Minute, "11140 request illegal"
 	}
-	e.sessionDeadFails = 0
-	p.disableLocked(e, sessionDeadReason)
-	return true
+	(*count)++
+	p.dirty.Store(true)
+	if *count >= sessionDeadThreshold {
+		*count = 0
+		p.disableLocked(e, reason)
+		return true
+	}
+	// 固定冷却不叠加熔断；保留更晚的既有账号冷却，避免缩短另一项惩罚。
+	if until := time.Now().Add(cooldown); until.After(e.until) {
+		e.until, e.coolKind = until, CoolSoft
+	}
+	e.reason = reason
+	clearRoutingModelCooldownsLocked(e)
+	return false
 }
 
-// ClearSessionDead 清连续 12153 计数——账号被证明未死的任何时刻调用：
+// ClearCredentialFailures 清连续 12153 / 11140 计数，供 refresh 成功时调用。
 // refresh 成功（RunKeepaliveNow）、chat 成功（NoteSuccess）、手工复活（ReviveDisabled）。
-func (p *Pool) ClearSessionDead(uid string) {
+func (p *Pool) ClearCredentialFailures(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		e.sessionDeadFails = 0
+		e.requestIllegalFails = 0
+		p.dirty.Store(true)
 	}
 }
 
@@ -66,6 +82,7 @@ func (p *Pool) ReviveDisabled(uid string) {
 		e.disabled = false
 		e.reason = ""
 		e.sessionDeadFails = 0
+		e.requestIllegalFails = 0
 		p.dirty.Store(true)
 	}
 }
@@ -89,6 +106,7 @@ func (p *Pool) Revive(uid string) bool {
 	e.softStreak = 0
 	e.modelCooldowns = nil // 模型级限流豁免随冷却一并清（防泄漏到后续账号级限流）
 	e.sessionDeadFails = 0
+	e.requestIllegalFails = 0
 	e.fails = 0
 	e.retryCount = 0
 	e.breakerUntil = time.Time{}
@@ -181,6 +199,7 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.breakerUntil = time.Time{}
 		e.softStreak = 0
 		e.sessionDeadFails = 0
+		e.requestIllegalFails = 0
 		e.consecutiveFails = 0
 		e.degradeUntil = time.Time{}
 		p.dirty.Store(true)

@@ -3,6 +3,7 @@ package pool
 import (
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
@@ -24,9 +25,11 @@ func TestNoteSessionDeadThresholdNotReached(t *testing.T) {
 	if st.Disabled {
 		t.Fatalf("连续 2 次 12153 不应禁用: %+v", st)
 	}
-	// 未达阈值时账号仍可选（keepalive 失败不污染选号）。
-	if got := p.Pick(); got == nil || got.UID != "u1" {
-		t.Fatalf("账号应保持可选, got %+v", got)
+	if !st.Cooling || st.CoolRemaining <= 0 || st.CoolRemaining > 60 {
+		t.Fatalf("前两次应短冷却60s: %+v", st)
+	}
+	if got := p.Pick(); got != nil {
+		t.Fatalf("冷却期不得被全池兜底捞回: %+v", got)
 	}
 }
 
@@ -52,13 +55,13 @@ func TestNoteSessionDeadDisablesAtThird(t *testing.T) {
 	}
 }
 
-// TestClearSessionDeadResetsCount 中间成功（refresh 成功）清计数，后续从 1 重新计。
-func TestClearSessionDeadResetsCount(t *testing.T) {
+// TestClearCredentialFailuresResetsCount 中间成功（refresh 成功）清计数，后续从 1 重新计。
+func TestClearCredentialFailuresResetsCount(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.NoteSessionDead("u1")
 	p.NoteSessionDead("u1")
-	p.ClearSessionDead("u1") // 模拟 refresh 成功：清计数
+	p.ClearCredentialFailures("u1") // 模拟 refresh 成功：清计数
 	if p.NoteSessionDead("u1") {
 		t.Fatal("清计数后第 1 次不应禁用")
 	}
@@ -158,5 +161,72 @@ func TestStatusDisabledReasonClearedByRevive(t *testing.T) {
 	}
 	if st.Reason != "" {
 		t.Errorf("revive 后 reason=%q want 空", st.Reason)
+	}
+}
+
+func TestCredentialFailuresPersistAndReset(t *testing.T) {
+	for _, illegal := range []bool{false, true} {
+		t.Run(map[bool]string{false: "session-dead", true: "request-illegal"}[illegal], func(t *testing.T) {
+			fp := filepath.Join(t.TempDir(), "state.json")
+			p := New(fp)
+			p.Add(&auth.Auth{UID: "u1"})
+			if p.noteCredentialFailure("u1", illegal) {
+				t.Fatal("first failure disabled account")
+			}
+			st, _ := p.Status("u1")
+			want := int64(60)
+			if illegal {
+				want = 1800
+			}
+			if !st.Cooling || st.CoolRemaining < want-1 || st.CoolRemaining > want {
+				t.Fatalf("cooldown=%+v want %ds", st, want)
+			}
+			if p.Pick() != nil {
+				t.Fatal("credential cooldown bypassed by pool fallback")
+			}
+			p.mu.Lock()
+			p.byUID["u1"].until = time.Now().Add(-time.Second)
+			p.mu.Unlock()
+			if p.Pick() == nil {
+				t.Fatal("account must be selectable after cooldown")
+			}
+			p.Flush()
+			restored := New(fp)
+			restored.Add(&auth.Auth{UID: "u1"})
+			if restored.noteCredentialFailure("u1", illegal) || !restored.noteCredentialFailure("u1", illegal) {
+				t.Fatal("persisted counter must disable on third failure")
+			}
+			restored.ReviveDisabled("u1")
+			if restored.noteCredentialFailure("u1", illegal) || restored.noteCredentialFailure("u1", illegal) {
+				t.Fatal("revive did not clear counter")
+			}
+			restored.NoteSuccess("u1")
+			restored.Flush()
+			afterSuccess := New(fp)
+			afterSuccess.Add(&auth.Auth{UID: "u1"})
+			if afterSuccess.noteCredentialFailure("u1", illegal) || afterSuccess.noteCredentialFailure("u1", illegal) {
+				t.Fatal("successful request did not persist cleared counter")
+			}
+			afterSuccess.Revive("u1")
+			if afterSuccess.noteCredentialFailure("u1", illegal) || afterSuccess.noteCredentialFailure("u1", illegal) {
+				t.Fatal("manual revive did not clear counter")
+			}
+		})
+	}
+}
+
+func TestClearCredentialFailuresPersists(t *testing.T) {
+	fp := filepath.Join(t.TempDir(), "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.NoteSessionDead("u1")
+	p.NoteSessionDead("u1")
+	p.Flush()
+	p.ClearCredentialFailures("u1")
+	p.Flush()
+	restored := New(fp)
+	restored.Add(&auth.Auth{UID: "u1"})
+	if restored.NoteSessionDead("u1") || restored.NoteSessionDead("u1") {
+		t.Fatal("refresh success reset was not persisted")
 	}
 }

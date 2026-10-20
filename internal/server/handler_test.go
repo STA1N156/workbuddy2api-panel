@@ -764,7 +764,7 @@ func TestChatAllUnavailableReturns503(t *testing.T) {
 	}
 }
 
-func TestChatSessionDeadDisables(t *testing.T) {
+func TestChatSessionDeadCoolsBeforeDisabling(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 401, `{"code":12153,"msg":"Offline user session not found"}`, false
 	})
@@ -777,8 +777,8 @@ func TestChatSessionDeadDisables(t *testing.T) {
 		t.Errorf("code=%d", rec.Code)
 	}
 	st, _ := p.Status("u1")
-	if !st.Disabled {
-		t.Errorf("account should be disabled: %+v", st)
+	if st.Disabled || !st.Cooling || st.CoolRemaining <= 0 || st.CoolRemaining > 60 {
+		t.Errorf("first session-dead response should cool 60s without disabling: %+v", st)
 	}
 }
 

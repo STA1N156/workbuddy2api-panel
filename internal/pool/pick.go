@@ -288,7 +288,7 @@ func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time
 
 // pickEarliestExpiryLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。
 // 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
-// CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
+// CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）；凭证错误冷却除外。
 // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
 //
 // 积分保底同样在此生效（model 非空时）：floor 把健康号全部拦掉后 cands 为空会走到
@@ -306,6 +306,10 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		}
 		if e.disabled || e.paused {
 			continue // 禁用/暂停选号的账号永不参与兜底
+		}
+		// 凭证错误必须等完短冷却，不能被全池冷却兜底立即捞回、连续误杀。
+		if now.Before(e.until) && (e.reason == sessionDeadReason || e.reason == "11140 request illegal") {
+			continue
 		}
 		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
 			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402

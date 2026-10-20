@@ -297,40 +297,34 @@ func TestRunKeepaliveRefreshesTokens(t *testing.T) {
 	}
 }
 
-func TestRunKeepaliveSessionDeadDisables(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(401)
-		w.Write([]byte(`{"code":12153,"msg":"Offline user session not found"}`))
-	}))
-	defer srv.Close()
-
-	p := pool.New("")
-	a := &auth.Auth{UID: "u1", AccessToken: "old", RefreshToken: "rt", ExpiresAt: 1}
-	p.Add(a)
-
-	up := &upstream.Client{
-		HTTP:          srv.Client(),
-		ChatBaseCN:    srv.URL,
-		BillingBaseCN: srv.URL,
-	}
-	s := New(Config{Pool: p, Upstream: up})
-	// P0-1：12153 连续 N 次才禁用。前 2 次刷新失败不应杀号（误判防护）。
-	s.RunKeepaliveNow()
-	if st, _ := p.Status("u1"); st.Disabled {
-		t.Fatalf("第 1 次 12153 不应禁用: %+v", st)
-	}
-	s.RunKeepaliveNow()
-	if st, _ := p.Status("u1"); st.Disabled {
-		t.Fatalf("第 2 次 12153 不应禁用: %+v", st)
-	}
-	// 第 3 次连续 12153 → 禁用。
-	s.RunKeepaliveNow()
-	st, _ := p.Status("u1")
-	if !st.Disabled {
-		t.Errorf("第 3 次连续 12153 应禁用: %+v", st)
-	}
-	if st.DisabledReason != "12153 session dead" {
-		t.Errorf("disabled_reason=%q want 12153 session dead", st.DisabledReason)
+func TestRunKeepaliveCredentialFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, reason string
+		cooldown           int64
+	}{
+		{"session-dead", `{"code":12153,"msg":"Offline user session not found"}`, "12153 session dead", 60},
+		{"request-illegal", `{"code":11140,"msg":"request illegal"}`, "11140 request illegal", 1800},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(401); w.Write([]byte(tc.body)) }))
+			defer srv.Close()
+			p := pool.New("")
+			p.Add(&auth.Auth{UID: "u1", AccessToken: "old", RefreshToken: "rt", ExpiresAt: 1})
+			s := New(Config{Pool: p, Upstream: &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}})
+			for i := 0; i < 3; i++ {
+				s.RunKeepaliveNow()
+				st, _ := p.Status("u1")
+				if st.Disabled != (i == 2) {
+					t.Fatalf("failure %d: %+v", i+1, st)
+				}
+				if i < 2 && (!st.Cooling || st.CoolRemaining < tc.cooldown-1 || st.CoolRemaining > tc.cooldown) {
+					t.Fatalf("cooldown: %+v", st)
+				}
+				if i == 2 && st.DisabledReason != tc.reason {
+					t.Fatalf("reason=%q", st.DisabledReason)
+				}
+			}
+		})
 	}
 }
 
@@ -673,7 +667,6 @@ func TestPausedVsDisabledTaskParticipation(t *testing.T) {
 		t.Errorf("checkin calls=%d want 2（正常 + 暂停参与；禁用跳过）", got)
 	}
 }
-
 
 // TestPausedStillTravels 暂停号照常跑旅行：旅行是纯 RPC（状态/派出/领奖 +
 // 领养前置上报），不发模型对话，与「让位防风控」不冲突——唯一被跳过的

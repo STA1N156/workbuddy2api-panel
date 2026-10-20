@@ -145,3 +145,31 @@ func TestTurnRequestIDDerivation(t *testing.T) {
 		}
 	}
 }
+
+func TestFallbackConversationIDWithUserID(t *testing.T) {
+	for _, field := range []string{`"metadata":{"user_id":"private-user"}`, `"user_id":"private-user"`} {
+		first := []byte(`{` + field + `,"messages":[{"role":"user","content":"first question"}]}`)
+		next := []byte(`{` + field + `,"messages":[{"role":"user","content":"first question"},{"role":"assistant","content":"answer"},{"role":"user","content":"next question"}]}`)
+		id := FallbackConversationID(first)
+		if len(id) != 32 || strings.Contains(id, "private-user") {
+			t.Fatalf("unexpected ID %q", id)
+		}
+		if FallbackConversationID(next) != id {
+			t.Fatal("same conversation changed ID")
+		}
+		if ExtractKey(first) != "" {
+			t.Fatal("user_id must not create account stickiness")
+		}
+		other := strings.ReplaceAll(string(first), "first question", "different conversation")
+		if FallbackConversationID([]byte(other)) == id {
+			t.Fatal("same user's conversations merged")
+		}
+		other = strings.ReplaceAll(string(first), "private-user", "another-user")
+		if FallbackConversationID([]byte(other)) == id {
+			t.Fatal("different users merged")
+		}
+	}
+	if a, b := FallbackConversationID([]byte(`{"user_id":"u"}`)), FallbackConversationID([]byte(`{"user_id":"u"}`)); a == "" || a == b {
+		t.Fatal("no conversation content should yield a fresh non-empty request ID")
+	}
+}

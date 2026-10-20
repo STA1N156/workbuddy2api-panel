@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -576,7 +577,7 @@ func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 // 它已经是终态，再计一次只会打出一行「— 禁用」的误导日志。
 // 12153 禁用走 Pool.NoteSessionDead 的**连续计数**语义：一次刷新失败不再立即杀号，
 // 连续 sessionDeadThreshold 次（3 次）才禁用（P0-1：13 个 disabled 号全是历史误判）。
-// 刷新成功 → ClearSessionDead 清计数（错误判定的账号有复活路径）。
+// 前两次失败由 NoteSessionDead 施加 60s 短冷却；刷新成功清计数。
 func (s *Scheduler) RunKeepaliveNow() {
 	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
@@ -590,14 +591,21 @@ func (s *Scheduler) RunKeepaliveNow() {
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
 			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			var ue *upstream.Error
-			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead && !st.Disabled {
-				if s.cfg.Pool.NoteSessionDead(st.UID) {
-					log.Printf("keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
+			if errors.As(err, &ue) && !st.Disabled {
+				switch {
+				case ue.Kind == upstream.ErrSessionDead:
+					if s.cfg.Pool.NoteSessionDead(st.UID) {
+						log.Printf("keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
+					}
+				case ue.Kind == upstream.ErrAccountFault && strings.Contains(strings.ToLower(ue.Msg), "request illegal"):
+					if s.cfg.Pool.NoteRequestIllegal(st.UID) {
+						log.Printf("keepalive %s: 连续 3 次 11140 request illegal — 禁用", logfmt.Label(st.UID, st.Nickname))
+					}
 				}
 			}
 			continue
 		}
-		s.cfg.Pool.ClearSessionDead(st.UID) // 刷新成功清误判计数，失败不该累计
+		s.cfg.Pool.ClearCredentialFailures(st.UID) // 刷新成功清误判计数，失败不该累计
 		if err := a.SaveAtomic(); err != nil {
 			log.Printf("keepalive %s save: %v", logfmt.Label(st.UID, st.Nickname), err)
 		}

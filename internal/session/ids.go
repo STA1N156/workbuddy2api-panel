@@ -21,7 +21,7 @@ import (
 // 复用 ExtractKey 的识别顺序：metadata 优先、snake 优先于 camel）。
 // 与 ExtractKey 的差异：**只认 conversationId，绝不回落 user_id**——X-Conversation-ID
 // 语义是"对话 ID"，user_id 回落会污染后台按对话聚合的判据。
-// 缺失返回 ""（不伪造：透传客户端原值优先，客户端没给就不发）。
+// 缺失返回 ""，调用方使用会话键或 FallbackConversationID 补齐上游会话头。
 func ResolveConversationID(body []byte) string {
 	if len(body) == 0 {
 		return ""
@@ -42,6 +42,25 @@ func ResolveConversationID(body []byte) string {
 		return v
 	}
 	return strOrEmpty(obj["conversationId"])
+}
+
+// FallbackConversationID 在未提供显式会话 ID 时生成上游会话头；与选号粘性解耦。
+// 内容派生确保同一对话多轮稳定，user_id 只作哈希命名空间、不作为对话键。
+// 无可用对话内容时退回请求级随机 ID；调用方在轮转循环外生成一次并复用。
+func FallbackConversationID(body []byte) string {
+	var obj map[string]any
+	if json.Unmarshal(body, &obj) == nil {
+		if key := deriveKey(obj); key != "" {
+			userID := strOrEmpty(obj["user_id"])
+			if meta, ok := obj["metadata"].(map[string]any); ok {
+				if id := strOrEmpty(meta["user_id"]); id != "" {
+					userID = id
+				}
+			}
+			return RequestIDForKey("conversation:" + userID + ":" + key)
+		}
+	}
+	return NewMessageID()
 }
 
 // NewMessageID 生成消息级 ID：32 位 hex（UUID v4 去横线的长度形态），对齐官方

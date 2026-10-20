@@ -8,13 +8,14 @@
 //
 // 迁移矩阵（事件 → 动作 → 字段）：
 //
-//	disabled           ← disableLocked（Disable / NoteSessionDead 达阈）
-//	until/coolKind     ← Cooldown(CoolSoft/Hard) / CooldownSoftForModel 无解析分支
+//	disabled           ← disableLocked（Disable / 凭证错误连续达阈）
+//	until/coolKind     ← Cooldown(CoolSoft/Hard) / CooldownSoftForModel 无解析分支 / NoteSessionDead / NoteRequestIllegal
 //	modelCooldowns     ← CooldownSoftForModel 有解析分支；被 disableLocked/Cooldown/clearCoolingLocked 清
 //	                     （reviveCoolingLocked 不清——余额恢复不构成限流解除证据）
 //	breakerUntil       ← recordBreakerFailureLocked（Cooldown/NoteError 喂入）；NoteSuccess 清
 //	softStreak         ← Cooldown(CoolSoft)/CooldownSoftForModel；NoteSuccess 清（revive 保留：与余额无关）
-//	sessionDeadFails   ← NoteSessionDead；ClearSessionDead/NoteSuccess/ReviveDisabled 清
+//	sessionDeadFails   ← NoteSessionDead；ClearCredentialFailures/NoteSuccess/ReviveDisabled 清
+//	requestIllegalFails ← NoteRequestIllegal；ClearCredentialFailures/NoteSuccess/Revive/ReviveDisabled 清
 //
 // 关键正交性（疑点 4 修正）：
 //   - 冷却域（until/coolKind/softStreak/modelCooldowns）与熔断器（fails/retryCount/
