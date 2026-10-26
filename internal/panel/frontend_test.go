@@ -13,9 +13,9 @@ import (
 	"time"
 )
 
-// TestAppJSSyntax app.js 必须能通过 JS 解析器语法校验。
+// TestAppJSSyntax app.js / mobile.js 必须能通过 JS 解析器语法校验。
 //
-// 为什么需要：app.js 是 go:embed 进二进制的静态资源，Go 编译器不检查其内容——
+// 为什么需要：两者都是 go:embed 进二进制的静态资源，Go 编译器不检查其内容——
 // 一次对象字面量键名未加引号（Model_chat_GLM5.2 被解析成属性访问 + 数字字面量）
 // 就让整个面板白屏，而所有 Go 测试依然全绿。此测试把语法校验前移到 CI。
 // 无 node 环境时跳过（不阻塞无 Node 的构建机）。
@@ -24,13 +24,15 @@ func TestAppJSSyntax(t *testing.T) {
 	if err != nil {
 		t.Skip("node not available; skipping JS syntax check")
 	}
-	path, err := filepath.Abs("app.js")
-	if err != nil {
-		t.Fatal(err)
-	}
-	out, err := exec.Command(node, "--check", path).CombinedOutput()
-	if err != nil {
-		t.Fatalf("app.js syntax error:\n%s", out)
+	for _, name := range []string{"app.js", "mobile.js"} {
+		path, err := filepath.Abs(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := exec.Command(node, "--check", path).CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s syntax error:\n%s", name, out)
+		}
 	}
 }
 
@@ -91,6 +93,9 @@ const sandbox = new Proxy({
   fetch: () => new Promise(() => {}),
   addEventListener() {}, removeEventListener() {},
   matchMedia: () => ({ matches: false, addEventListener() {} }),
+  // mobile.js 顶层直接 new MutationObserver(...)（移动端表格字段名补标签）：
+  // 该文件不在本沙箱内执行，但保留此桩，将来把 mobile.js 纳入冒烟时可直接复用。
+  MutationObserver: class { constructor() {} observe() {} disconnect() {} takeRecords() { return []; } },
   setInterval, clearInterval, setTimeout, clearTimeout,
   console, JSON, Math, Date, Number, String, Boolean, Object, Array, Promise, Map, Set, RegExp, Error, TypeError, isNaN, parseInt, parseFloat, encodeURIComponent, decodeURIComponent, URL, Symbol, Proxy, Reflect,
 }, { get(t, k) { return t[k]; }, has() { return true; } });
@@ -212,7 +217,8 @@ process.stdout.write(JSON.stringify({
 	if err != nil {
 		t.Fatalf("rate-limit formatting node test failed: %v\n%s", err, out)
 	}
-	const want = `{"rate":"预计 2026-09-28 16:00 解封（剩余 2时00分） · 网关最快 1时00分 后重试","unavailable":"预计 1时00分 后重试","unknown":"预计解封时间未知"}`
+	// issue #171 问题二：until < resetAt 时主文字双时刻明示、倒计时跟随 until。
+	const want = `{"rate":"网关 2026-09-28 15:00 起重试（剩余 1时00分） · 上游称 2026-09-28 16:00 恢复","unavailable":"预计 1时00分 后重试","unknown":"预计解封时间未知"}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("rate-limit formatting=%s want %s", out, want)
 	}
@@ -268,6 +274,53 @@ process.stdout.write(JSON.stringify({
 	want := `{"good":` + strconv.Quote(text) + `,"noSource":` + strconv.Quote(noSource) + `,"cached":` + strconv.Quote(cached) + `}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("request log formatting=%s want %s", out, want)
+	}
+}
+
+// 积分历史区块：变动列 +N / −N（U+2212）、余额千分位、空列表提示。
+func TestAppJSCreditHistoryFormatting(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; credit history formatting test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function creditNum');
+const end = src.indexOf('function renderCreditHistory');
+if (start < 0 || end < 0) throw new Error('credit history helpers not found');
+const ctx = { Date, Number, String, Math, RegExp, isNaN };
+vm.createContext(ctx);
+vm.runInContext(
+  src.slice(start, end) +
+  '\nthis.creditEntryText=creditEntryText;this.creditHistoryNote=creditHistoryNote;',
+  ctx
+);
+const time = new Date(2026, 8, 28, 14, 5, 6).toISOString();
+process.stdout.write(JSON.stringify({
+  gain: ctx.creditEntryText({ time, uid: '89374120', account: '小明', delta: 100, before: 1300, after: 1400 }),
+  loss: ctx.creditEntryText({ time, uid: '89374120', account: '', delta: -30, before: 1400, after: 1370 }),
+  note: ctx.creditHistoryNote([{ delta: 1300 }, { delta: -60 }]),
+  empty: ctx.creditHistoryNote([]),
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "credit-history-format-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("credit history formatting node test failed: %v\n%s", err, out)
+	}
+	gain := "14:05:06 | 小明 | +100 | 1,400 | 余额 1,300 → 1,400"
+	loss := "14:05:06 | 89374120 | −30 | 1,370 | 余额 1,400 → 1,370"
+	want := `{"gain":` + strconv.Quote(gain) + `,"loss":` + strconv.Quote(loss) +
+		`,"note":"2 条 · 净 +1,240","empty":"暂无积分变动记录"}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("credit history formatting=%s want %s", out, want)
 	}
 }
 
@@ -395,6 +448,58 @@ process.stdout.write(JSON.stringify({
 		`"rateFree":0,"rateMissing":null}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("model filter=%s\nwant %s", out, want)
+	}
+}
+
+// Global 模型可用性标签：模型锁优先于最近请求；无本地证据时保持“待验证”，
+// 不能把上游目录里出现模型误判为当前账号有权限。
+func TestAppJSModelAvailability(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; model availability test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function mdAvailabilityOf');
+const end = src.indexOf('function mdRowHtml');
+if (start < 0 || end < 0) throw new Error('model availability helpers not found');
+const ctx = { esc: s => String(s) };
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.mdAvailabilityOf=mdAvailabilityOf; this.mdAvailabilityTag=mdAvailabilityTag;', ctx);
+const model = id => ({ id });
+const state = (m, locks, recent) => ctx.mdAvailabilityOf(m, locks, recent).key;
+const success = [{ model: 'global:ok', status: 200, outcome: 'success', time: '2026-10-18T12:00:00Z' }];
+ctx.mdLocks = [{ realm: 'global', model: 'gpt-5.6-sol', state: 'locked', reason: '11158 model not allowed for account type' }];
+ctx.mdRecent = [];
+const deniedTag = ctx.mdAvailabilityTag(model('global:gpt-5.6-sol'));
+process.stdout.write(JSON.stringify({
+  cn: ctx.mdAvailabilityOf(model('cn:glm-5.3'), [], []),
+  unknown: state(model('global:unknown'), [], []),
+  denied: state(model('global:gpt-5.6-sol'), [{ realm: 'global', model: 'gpt-5.6-sol', state: 'locked', reason: '11158 model not allowed for account type' }], []),
+  missing: state(model('global:auto-chat'), [{ realm: 'global', model: 'auto-chat', state: 'locked', reason: '11102 service info not found' }], []),
+  partial: state(model('global:glm-5.3'), [{ realm: 'global', model: 'glm-5.3', state: 'partial', reason: '6004 model rate limit' }], []),
+  starved: state(model('global:glm-5.3'), [{ realm: 'global', model: 'glm-5.3', state: 'starved' }], []),
+  rate: state(model('global:glm-5.3'), [], [{ model: 'global:glm-5.3', status: 429 }]),
+  upstream: state(model('global:glm-5.3'), [], [{ model: 'global:glm-5.3', status: 503 }]),
+  ok: state(model('global:ok'), [], success),
+  deniedTag: deniedTag.includes('无权限') && deniedTag.includes('tag bad'),
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "model-availability-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("model availability node test failed: %v\n%s", err, out)
+	}
+	const want = `{"cn":null,"unknown":"unknown","denied":"denied","missing":"missing","partial":"partial","starved":"starved","rate":"rate","upstream":"upstream","ok":"ok","deniedTag":true}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("model availability=%s want %s", out, want)
 	}
 }
 
@@ -773,181 +878,6 @@ process.stdout.write(JSON.stringify([
 	}
 }
 
-// TestAppJSExpirySortedByExpiry 到期提醒按「最近到期」升序，且不分域（issue #125）。
-//
-// 后端 /panel/api/packages 是按**余额降序**返回的，恰好把 CN 账号都排在前面、
-// global 排在末尾，看上去像"按域分组"，实际只是余额顺序。本用例刻意按这个形态构造
-// 输入（余额高的到期最晚、global 余额最低），若前端不重排就会保持该顺序而失败。
-//
-// 日期按「今天 +N 天」生成而不是写死：写死的话过了那天用例就会自己失效。
-func TestAppJSExpirySortedByExpiry(t *testing.T) {
-	node, err := exec.LookPath("node")
-	if err != nil {
-		t.Skip("node not installed; expiry sort test skipped")
-	}
-	script := `const fs = require('fs');
-const vm = require('vm');
-const src = fs.readFileSync(process.argv[2], 'utf8');
-const start = src.indexOf('function expBatches');
-const end = src.indexOf('async function loadExpiry');
-if (start < 0 || end < 0 || end < start) throw new Error('expiry region not found');
-const sink = { innerHTML: '', textContent: '', hidden: true };
-const ctx = {
-  esc: s => String(s == null ? '' : s),
-  fmtTok: v => String(v == null ? 0 : v),
-  $: () => sink,
-  Date, Math, Number, String, Map, Array, Object, isNaN,
-  lastPackages: null, lastPackagesAt: 0,
-};
-vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.renderExpiry = renderExpiry;', ctx);
-const iso = n => {
-  const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() + n);
-  const p = x => String(x).padStart(2, '0');
-  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
-};
-const pack = (days, amount) => ({ end_time: iso(days) + ' 00:00:00', remain: amount });
-// 模拟后端顺序：余额降序 → CN 高余额在前且到期最晚，global 最少且最快到期。
-const d = { accounts: [
-  { uid: 'a', nickname: 'cn-late',  realm: 'cn',     packages: [pack(16, 900)] },
-  { uid: 'b', nickname: 'cn-mid',   realm: 'cn',     packages: [pack(12, 700)] },
-  { uid: 'c', nickname: 'gl-soon',  realm: 'global', packages: [pack(2, 500)] },
-  { uid: 'd', nickname: 'no-expiry', realm: 'cn',    packages: [pack(-3, 100)] },
-  { uid: 'e', nickname: 'broken',   realm: 'cn',     error: 'offline' },
-] };
-ctx.renderExpiry(d);
-const names = [...sink.innerHTML.matchAll(/<span class="exp-nm">([^<]*)<\/span>/g)].map(m => m[1]);
-process.stdout.write(JSON.stringify(names));`
-	f, err := os.CreateTemp(t.TempDir(), "expsort-*.cjs")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.WriteString(script); err != nil {
-		t.Fatal(err)
-	}
-	f.Close()
-	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
-	if err != nil {
-		t.Fatalf("expiry sort node test failed: %v\n%s", err, out)
-	}
-	// 最快到期的排最前（跨域）；无 7 天内到期的与查询失败的排最后。
-	const want = `["gl-soon","cn-mid","cn-late","no-expiry","broken"]`
-	if strings.TrimSpace(string(out)) != want {
-		t.Fatalf("expiry order=%s\nwant %s", strings.TrimSpace(string(out)), want)
-	}
-}
-
-// TestAppJSExpirySnapshotRenders 到期卡片用 overview 快照即可渲染（issue #137）。
-//
-// 此前的死锁：卡片在 index.html 上写死 hidden，而唯一解除隐藏的语句在
-// renderExpiry() 末尾——该函数只有点「检查」才被调用。按钮本身就在隐藏卡片里，
-// 用户看不见也点不到，于是"积分到期提醒"这个功能等于不存在。
-//
-// 修复引入 renderExpirySnapshot()：吃 /overview 响应里的 credits_earliest_expiry /
-// credits_earliest_remaining（state.json 现成数据，零上游请求），并显式设
-// expBox.hidden = false。本用例钉住两件事：
-//  1. 只给 overview 形态的输入（没有 packages 字段）也能出内容；
-//  2. 渲染后 expBox.hidden 必须为 false——把这句删掉（还原 bug）测试就必须 FAIL。
-func TestAppJSExpirySnapshotRenders(t *testing.T) {
-	node, err := exec.LookPath("node")
-	if err != nil {
-		t.Skip("node not installed; expiry snapshot test skipped")
-	}
-	script := `const fs = require('fs');
-const vm = require('vm');
-const src = fs.readFileSync(process.argv[2], 'utf8');
-const start = src.indexOf('function renderExpirySnapshot');
-const end = src.indexOf('async function loadExpiry');
-if (start < 0 || end < 0 || end < start) throw new Error('expiry snapshot region not found');
-const sinks = {};
-const mk = id => (sinks[id] = { innerHTML: '', textContent: '', hidden: true });
-const ctx = {
-  esc: s => String(s == null ? '' : s),
-  fmtTok: v => String(v == null ? 0 : v),
-  $: id => (sinks[id] || mk(id)),
-  Date, Math, Number, String, Map, Array, Object, isNaN,
-};
-vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.renderExpirySnapshot = renderExpirySnapshot;', ctx);
-const day = n => {
-  const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() + n);
-  return d.toISOString();
-};
-// overview 形态：没有 packages 数组，只有到期快照字段。
-const d = { accounts: [
-  { uid: 'aaaaaaaa-1', nickname: '秋',     credits: 4099,
-    credits_earliest_expiry: day(2),  credits_earliest_remaining: 499 },
-  { uid: 'bbbbbbbb-2', nickname: '秋千易', credits: 3243,
-    credits_earliest_expiry: day(30), credits_earliest_remaining: 43 },
-  { uid: 'cccccccc-3', nickname: '长期包', credits: 900,
-    credits_earliest_expiry: null,    credits_earliest_remaining: 0 },
-] };
-ctx.renderExpirySnapshot(d);
-const html = sinks['expList'] ? sinks['expList'].innerHTML : '';
-const names = [...html.matchAll(/<span class="exp-nm">([^<]*)<\/span>/g)].map(m => m[1]);
-// 2 天到期的应排最前（红），30 天其次，无到期信息的排最后。
-const wantNames = JSON.stringify(['秋', '秋千易', '长期包']);
-const gotNames = JSON.stringify(names);
-process.stdout.write(JSON.stringify({
-  visible: sinks['expBox'] ? sinks['expBox'].hidden === false : false,
-  rows: names.length,
-  order: gotNames === wantNames,
-  got: gotNames,
-  want: wantNames,
-}));`
-	f, err := os.CreateTemp(t.TempDir(), "expsnap-*.cjs")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.WriteString(script); err != nil {
-		t.Fatal(err)
-	}
-	f.Close()
-	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
-	if err != nil {
-		t.Fatalf("expiry snapshot node test failed: %v\n%s", err, out)
-	}
-	const want = `{"visible":true,"rows":3,"order":true,"got":"[\"秋\",\"秋千易\",\"长期包\"]","want":"[\"秋\",\"秋千易\",\"长期包\"]"}`
-	if strings.TrimSpace(string(out)) != want {
-		t.Fatalf("expiry snapshot=%s\nwant %s（visible 必须为 true，否则卡片仍隐藏）",
-			strings.TrimSpace(string(out)), want)
-	}
-}
-
-// TestPanelIndexExpiryBoxNotHidden 到期卡片在 HTML 骨架里不得带 hidden 属性（issue #137）。
-//
-// 与上一个用例互补：app.js 侧有 renderExpirySnapshot 兜底，HTML 侧若仍写死 hidden，
-// 用户在首次 overview 返回前（以及 JS 加载失败时）看到的依然是空白。这个断言就是
-// 那个曾经卡住整个功能的属性——把它加回去测试必须 FAIL。
-func TestPanelIndexExpiryBoxNotHidden(t *testing.T) {
-	b, err := os.ReadFile("index.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// 定位到期卡片那一行，只检查它自己，避免误伤其他合法的 hidden 元素。
-	idx := strings.Index(string(b), `id="expBox"`)
-	if idx < 0 {
-		t.Fatal(`index.html missing id="expBox"`)
-	}
-	lineStart := strings.LastIndex(string(b[:idx]), "\n") + 1
-	lineEnd := strings.Index(string(b[idx:]), "\n")
-	if lineEnd < 0 {
-		lineEnd = len(b) - idx
-	}
-	line := string(b[lineStart : idx+lineEnd])
-	if strings.Contains(line, "hidden") {
-		t.Fatalf(`expBox 元素不得带 hidden（issue #137 死锁根因），实际行：%s`, strings.TrimSpace(line))
-	}
-}
-
-// TestAppJSChartTooltipInsideBar 图表 tooltip 必须挂在每根柱子内部（issue #128）。
-//
-// <title> 在 SVG 里描述的是**父元素**。此前它被平铺在 <svg> 根下（<rect> 是自闭合的，
-// 无法包含子节点），于是整张图共用一个 tooltip —— 浏览器取第一个 —— 悬停任何柱子都
-// 显示同一份数据。这类问题不报错、不影响渲染，只靠肉眼看很容易漏。
-//
-// 断言结构：<g> 数量 == 数据点数，且每个 <g> 紧跟一个 <title>；同时确认没有
-// 游离在 <g> 之外的 <title>。
 func TestAppJSChartTooltipInsideBar(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
@@ -1004,5 +934,150 @@ process.stdout.write(JSON.stringify({
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("chart tooltip structure=%s\nwant %s（groups 应等于数据点数，loose 应为 0）",
 			strings.TrimSpace(string(out)), want)
+	}
+}
+
+// TestMobileJSChartTooltipInsideBar 手机端自绘图表的 tooltip 同样要挂在柱子内部（issue #128）。
+//
+// mobile.js 在窄屏另画一张图（440×230），不走 app.js 的 renderUsageChart：上游修好
+// 桌面实现不会覆盖它。断言与 TestAppJSChartTooltipInsideBar 同构，只取文件里
+// 「接管 renderUsageChart」之后的部分，DOM/全局用桩喂进去。
+func TestMobileJSChartTooltipInsideBar(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; mobile chart tooltip test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('const deskUsageChart');
+if (start < 0) throw new Error('mobile chart override not found');
+const sinks = {};
+const mk = id => (sinks[id] = { innerHTML: '', textContent: '' });
+const ctx = {
+  MOBILE_MQ: { matches: true },
+  renderUsageChart: () => {},
+  esc: s => String(s == null ? '' : s),
+  fmtTok: v => String(v == null ? 0 : v),
+  fmtTokTimeLabel: p => { const d = new Date(p.t.length === 13 ? p.t + ':00:00' : p.t + 'T00:00:00');
+                          return p.scope === 'day' ? (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0')
+                                                   : String(d.getHours()).padStart(2, '0') + ':00'; },
+  parsePointTime: p => { const d = new Date(p.t.length === 13 ? p.t + ':00:00' : p.t + 'T00:00:00');
+                         return isNaN(d.getTime()) ? null : d.getTime(); },
+  $: id => (sinks[id] || mk(id)),
+  Date, Math, Number, String, Map, Array, Object, isNaN, Infinity, isFinite, Set,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start) + '\nthis.renderUsageChart = renderUsageChart;', ctx);
+const series = [];
+for (let h = 0; h < 5; h++) {
+  const d = new Date(); d.setHours(d.getHours() - (4 - h), 0, 0, 0);
+  const iso = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' +
+              String(d.getDate()).padStart(2, '0') + 'T' + String(d.getHours()).padStart(2, '0');
+  series.push({ t: iso, scope: 'hour', prompt_tokens: (h + 1) * 100,
+                completion_tokens: (h + 1) * 10, total_tokens: (h + 1) * 110, requests: h + 1 });
+}
+ctx.renderUsageChart(series);
+const svg = sinks['usChart'] ? sinks['usChart'].innerHTML : '';
+const groups = svg.match(/<g><title>/g) || [];
+const titles = svg.match(/<title>[^<]*<\/title>/g) || [];
+const loose = (svg.match(/(?:<rect[^>]*\/>|<\/g>)<title>/g) || []).length;
+process.stdout.write(JSON.stringify({
+  points: series.length, groups: groups.length, titles: titles.length, loose: loose,
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "mobilecharttip-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "mobile.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("mobile chart tooltip node test failed: %v\n%s", err, out)
+	}
+	const want = `{"points":5,"groups":5,"titles":5,"loose":0}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("mobile chart tooltip structure=%s\nwant %s（groups 应等于数据点数，loose 应为 0）",
+			strings.TrimSpace(string(out)), want)
+	}
+}
+
+// 账号备注：键取 uid 前 8 位（与 renderUsageDim 账号维度、积分扣除表的 uid 前缀同源，
+// 三个表格因此能直接 join）；有备注时备注当主标识、原昵称作浅色虚体跟随；备注来自本机
+// 输入，必须转义后才能拼进 innerHTML。
+func TestAppJSRemarkName(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; remark name test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const escStart = src.indexOf('function esc(');
+const escEnd = src.indexOf('function ago(');
+const start = src.indexOf('function remarkKey(');
+const end = src.indexOf('function storeRemarks(');
+if (escStart < 0 || escEnd < 0) throw new Error('esc helpers not found');
+if (start < 0 || end < 0) throw new Error('remark helpers not found');
+const ctx = { String, RegExp, Number };
+vm.createContext(ctx);
+vm.runInContext(
+  src.slice(escStart, escEnd) + src.slice(start, end) +
+  '\nconst REM = {abcdef12: "JTOL", deadbeef: "<b>x</b>"};' +
+  '\nfunction remarksAll() { return REM; }' +
+  '\nthis.remarkKey=remarkKey; this.remarkName=remarkName;',
+  ctx
+);
+process.stdout.write(JSON.stringify({
+  key: ctx.remarkKey('ABCDEF1234567890'),
+  short: ctx.remarkKey('abc'),
+  empty: ctx.remarkKey(null),
+  remarked: ctx.remarkName('abcdef12', '张三'),
+  plain: ctx.remarkName('zzzzzzzz', '张三'),
+  escaped: ctx.remarkName('deadbeef', 'n'),
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "remark-name-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("remark name node test failed: %v\n%s", err, out)
+	}
+	const want = `{"key":"ABCDEF12","short":"abc","empty":"","remarked":"JTOL<span class=\"rm-ghost\">张三</span>","plain":"张三","escaped":"&lt;b&gt;x&lt;/b&gt;<span class=\"rm-ghost\">n</span>"}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("remark name=%s\nwant %s", strings.TrimSpace(string(out)), want)
+	}
+}
+
+// 账号备注入口和本机存储须保持可用。
+func TestPanelRemarkWiring(t *testing.T) {
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`id="btnRemarks"`, `id="remarkVeil"`, `id="remarkBody"`, `id="btnRemarkSave"`, `id="btnRemarkClear"`} {
+		if !bytes.Contains(html, []byte(want)) {
+			t.Fatalf("index.html 缺少 %s", want)
+		}
+	}
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"LS_REMARKS = 'wb2api.remarks.v1'",
+		"function remarkKey(",
+		"function remarkName(",
+	} {
+		if !bytes.Contains(js, []byte(want)) {
+			t.Fatalf("app.js 缺少 %s", want)
+		}
 	}
 }

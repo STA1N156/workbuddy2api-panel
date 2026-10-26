@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -41,6 +42,7 @@ const (
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
+	ErrUpstreamBusy                  // 6021「queue.full.title」渠道级容量满载（非账号问题）→ 不罚号、不轮转，末端 503 + upstream_busy
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
@@ -68,6 +70,8 @@ func (k ErrKind) String() string {
 		return "prompt_too_long"
 	case ErrImageInvalid:
 		return "image_invalid"
+	case ErrUpstreamBusy:
+		return "upstream_busy"
 	case ErrAccountFault:
 		return "account_fault"
 	case ErrClient:
@@ -121,6 +125,14 @@ var softRateMarkers = []string{
 }
 
 var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
+
+// isQueueFullBody 判定渠道级容量满载文案（6021 queue.full.title 家族）。
+// 该形态表明上游推理集群排队队列打满，与具体账号无关；换号在任何时刻都会撞
+// 同一堵墙，正确处置是不罚号不轮转（见 Classify 的 6021 分支）。子串口径但
+// 用完整固定文案（"queue.full"），避免与普通限流文案误撞。
+func isQueueFullBody(lower string) bool {
+	return strings.Contains(lower, "queue.full") || strings.Contains(lower, "queue full")
+}
 
 // accountFaultMarkers 账号级授权/配额故障关键词（大小写不敏感子串匹配）。
 //
@@ -471,21 +483,25 @@ func ParseRateReset(body string) (time.Time, bool) {
 //     不受影响。
 //  4. 429 + code 14018 —— 明确的账号积分耗尽，归 ErrHardCredit（issue #175）。
 //     只认结构化业务码，不靠可能跨计费/限流两界的文案猜测。
-//  5. status==429 —— 限流状态码兜底（先于 hardMarkers）：429 body 高频携带
+//  5. 429 + 6021 queue.full —— 渠道级容量满载（上游集群排队打满），归
+//     ErrUpstreamBusy：非账号问题，不罚号不轮转（2026-10-15 实案：按限流处置
+//     2 秒绞杀整池 DeepSeek 号）。判在 status==429 兜底**之前**——它是比
+//     「限流」更具体的渠道级信号（同 14018 的具体优先哲学）。
+//  6. status==429 —— 限流状态码兜底（先于 hardMarkers）：429 body 高频携带
 //     "quota exceeded"/"额度不足" 等跨计费/限流两界的措辞，hardMarkers 先判会把
 //     限流误归 ErrHardCredit 硬冷却到次日 04:00，白扔号约 12h。状态码是比关键词
 //     更权威的信号；真正的余额耗尽由 402（第 1 层）或 14018（第 4 层）捕获，
-//     非 429 状态码的 quota 措辞仍走下方 hardMarkers（第 6 层）。
-//  6. hardMarkers —— 非 429 响应携带计费关键词（200 业务信封 / 403 信封等）。
-//  7. softRateMarkers —— 非 429 状态码携带限流文案（issue #28 修复点）。
+//     非 429 状态码的 quota 措辞仍走下方 hardMarkers（第 7 层）。
+//  7. hardMarkers —— 非 429 响应携带计费关键词（200 业务信封 / 403 信封等）。
+//  8. softRateMarkers —— 非 429 状态码携带限流文案（issue #28 修复点）。
 //     位于此处可覆盖 200/400/403/5xx 各状态码。
-//  8. 11115 —— 「prompt is too long」请求级语义：判在 404/5xx 与通用 4xx 兜底
+//  9. 11115 —— 「prompt is too long」请求级语义：判在 404/5xx 与通用 4xx 兜底
 //     之前（404 上打 11115 若落 ErrNotFound 会误冷却账号——上下文超限与账号无关）。
-//  9. 404 / 5xx —— 与限流无关的常规分类。
-//  10. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：APISIX WAF
+//  10. 404 / 5xx —— 与限流无关的常规分类。
+//  11. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：APISIX WAF
 //     拦截形态。判在通用 4xx 兜底**之前**：此前该形态落 ErrClient → 只换号不罚 →
 //     连环 403。带业务信封的 403 已被上方各层捕获，走不到本层。
-//  11. 内容策略/参数错误/其他 4xx —— 通用兜底。
+//  12. 内容策略/参数错误/其他 4xx —— 通用兜底。
 func Classify(status int, body string) ErrKind {
 	// 11102「该后端无此模型」须最先判：它是「模型在后端不存在」的确定性答复，语义比
 	// 计费/限流都更具体——若不先判，msg 里的 "service info not found" 会被更宽的
@@ -517,6 +533,15 @@ func Classify(status int, body string) ErrKind {
 	// 判定；无该 code 的 "credits exhausted" 文案仍保持普通 429 的软限流语义。
 	if status == http.StatusTooManyRequests && hasBusinessCode(body, "14018") {
 		return ErrHardCredit
+	}
+	// 6021「queue.full.title」是**渠道级容量满载**（上游推理集群排队队列打满），
+	// 不是账号问题：同一时刻换任何账号都会撞同一堵墙。必须先于通用 429 兜底，
+	// 否则会按 ErrSoftRate 逐号软冷却——实测 2 秒内即可把整池健康号全部误杀
+	// 冷却（2026-10-15 实案），且换号白撞放大请求量。429 + 结构化 code 为主判据
+	// （与 14018 同口径）；"queue.full" 固定文案单列为外卡——该文案是上游 i18n
+	// key 原文，语义唯一，非 429 状态码出现同样归本类（防上游换状态码）。
+	if (status == http.StatusTooManyRequests && hasBusinessCode(body, "6021")) || isQueueFullBody(lower) {
+		return ErrUpstreamBusy
 	}
 	// status==429 先于 hardMarkers：限流响应 body 高频携带 "quota exceeded"/
 	// "额度不足" 等跨计费/限流两界的措辞，hardMarkers 先判会把限流误归
@@ -681,7 +706,23 @@ type Client struct {
 	// false 时即便用户 auth 写了 realm=global 也**不**路由到 global base——
 	// chatBase/billingBase 返回 CN base，路径也走 CN（双保险，与 auth.Realm() 的开关闸呼应）。
 	GlobalEnabled bool
+
+	// refreshMu/refreshInFlight 同账号 refresh 单飞（按 UID 分桶）：同一时刻只允许
+	// 一个 refresh 在途，其余调用等待并复用首个结果。上游对 refreshToken 反重放，
+	// 并发第二发会带着已被消费的 RT 撞 12153 并整链作废（issue #215：账号从此恒
+	// 401，只能人工重登）。单飞在这里是保号手段，不只是省流量。
+	refreshMu       sync.Mutex
+	refreshInFlight map[string]*refreshFlight
+	// creditObserver 余额查询观察者（见 CreditObserver / SetCreditObserver）。
+	// atomic：启动期挂载、运行期并发读，不参与任何出站决策。
+	creditObserver atomic.Pointer[CreditObserver]
 }
+
+// CreditObserver 余额查询观察者：每次**真实查到**余额后回调（uid + 余额绝对值）。
+// 旁路通知，不改变任何透传字节；未挂载时零开销。用于积分历史留痕
+// （internal/credithist）：余额查询是"积分变动"唯一可靠的观测口——签到 / 活跃
+// 上报等渠道上游不落金额日志，只能靠比对余额覆盖。
+type CreditObserver func(uid string, credits int64)
 
 // New 生产默认值。Transport 由 newTransport() 集中构造（连接层加固：真正禁 h2 /
 // TLS 握手超时 / 短 keepalive 探测 / 失败清池，参数见 transport.go——吸收上游
@@ -901,13 +942,92 @@ const refreshTokenExpiresInMax = 10 * 365 * 24 * time.Hour
 // RefreshToken 刷新 access token；成功时更新 a 的字段（缺省值保留旧值），
 // 调用方负责 SaveAtomic。
 //
-// 并发安全模型（两段式，缩小持锁窗口）：
-//   - 锁内仅做「读 refreshToken 快照」与「校验未变后写回新 token」两小段内存操作；
-//   - 网络 I/O（doJSON）在**锁外**执行，带 30s ctx 超时——避免上游 hang 时长时间
-//     独占 a.mu，阻塞同账号的 SaveAtomic / 其他刷新（issue:持锁 120s I/O）。
-//   - 写回前重新校验快照一致性：若锁外期间另一 goroutine 已完成刷新（refreshToken
-//     已变），本次结果直接采用（新 token 已生效），不再重复写回。
+// 并发安全模型（单飞 + 两段式）：
+//   - **单飞**：同一账号（UID）同一时刻只允许一个 refresh 在途，其余调用等待并
+//     原样复用首个结果。上游对 refreshToken 有反重放：RT 被消费后再用会撞 12153
+//     （refresh token is invalid）并把整条 RT 链作废，账号从此恒 401、只能人工
+//     重新登录（issue #215：scheduler keepalive / handler 临近过期刷新 / signin
+//     会并发触发同一账号）。所以单飞在这里是保号手段，而不只是省流量。
+//   - 首个调用内部仍是两段式：锁内读快照 → 锁外 I/O（30s）→ 锁内校验快照一致后
+//     写回；写回前若发现另一刷新已完成（两 token 同时变化）则直接采用。
+//   - 12153 兜底：若磁盘 auth 文件已被其他进程（server + signin 双进程部署）刷新
+//     过，则采纳磁盘 token 重试一次——进程内单飞挡不住跨进程竞态。
 func (c *Client) RefreshToken(a *auth.Auth) error {
+	key := a.UID
+	if key == "" {
+		// 无 UID 的临时 auth：退化为按对象指针去重，仍保证同一对象串行。
+		key = fmt.Sprintf("%p", a)
+	}
+	c.refreshMu.Lock()
+	if c.refreshInFlight == nil {
+		c.refreshInFlight = make(map[string]*refreshFlight)
+	}
+	if f, ok := c.refreshInFlight[key]; ok {
+		c.refreshMu.Unlock()
+		<-f.done
+		return f.err
+	}
+	f := &refreshFlight{done: make(chan struct{})}
+	c.refreshInFlight[key] = f
+	c.refreshMu.Unlock()
+
+	err := c.refreshTokenOnce(a)
+	if err != nil && isSessionDead(err) && adoptNewerTokensFromDisk(a) {
+		// 跨进程竞态：磁盘 RT 已被别的进程 rotate 过，用新 RT 再试一次。
+		err = c.refreshTokenOnce(a)
+	}
+
+	// 先写结果再关 channel：等待者 <-f.done 之后读到的一定是最终 err。
+	f.err = err
+	close(f.done)
+	c.refreshMu.Lock()
+	delete(c.refreshInFlight, key)
+	c.refreshMu.Unlock()
+	return err
+}
+
+// refreshFlight 是同一账号一次 refresh 的单飞票据：done 关闭即结果就绪。
+type refreshFlight struct {
+	done chan struct{}
+	err  error
+}
+
+// isSessionDead 判定错误是否为上游 12153（会话 / RT 失效）。
+func isSessionDead(err error) bool {
+	var ue *Error
+	return errors.As(err, &ue) && ue.Kind == ErrSessionDead
+}
+
+// adoptNewerTokensFromDisk 在 refresh 失败后读回 auth 文件：若磁盘 RT 与内存不同
+// （另一进程已刷新并写回），采纳磁盘 token 并返回 true，供调用方重试一次。
+// 读文件失败、解析失败、RT 一致均返回 false（不改内存状态），保持失败语义。
+func adoptNewerTokensFromDisk(a *auth.Auth) bool {
+	if a.FilePath == "" {
+		return false
+	}
+	raw, err := os.ReadFile(a.FilePath)
+	if err != nil {
+		return false
+	}
+	disk, err := auth.Parse(raw)
+	if err != nil || strings.TrimSpace(disk.RefreshToken) == "" {
+		return false
+	}
+	a.Lock()
+	defer a.Unlock()
+	if disk.RefreshToken == a.RefreshToken {
+		return false
+	}
+	a.AccessToken = disk.AccessToken
+	a.RefreshToken = disk.RefreshToken
+	if disk.ExpiresAt > 0 {
+		a.ExpiresAt = disk.ExpiresAt
+	}
+	return true
+}
+
+// refreshTokenOnce 是单次刷新本体（调用方 RefreshToken 已保证同账号串行）。
+func (c *Client) refreshTokenOnce(a *auth.Auth) error {
 	// 第 1 段（锁内）：读快照。
 	a.Lock()
 	rtSnapshot := a.RefreshToken
@@ -2052,7 +2172,9 @@ func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration
 	// 企业版额度不在「个人资源包」体系内：get-user-resource* 对 enterpriseId 非空账号
 	// 恒返回空 Accounts（实测 code 0 且 Accounts null），故分流到企业口径端点。
 	if a.IsEnterprise() {
-		return c.enterpriseResource(a, soon)
+		remain, total, expiring, earliestAt, earliestRemaining, err = c.enterpriseResource(a, soon)
+		c.notifyCredits(a, remain, err)
+		return
 	}
 	now := time.Now()
 	body := map[string]any{
@@ -2128,7 +2250,41 @@ func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration
 			expiring += r
 		}
 	}
+	c.notifyCredits(a, remain, nil)
 	return remain, total, expiring, earliestAt, earliestRemaining, nil
+}
+
+// SetCreditObserver 挂载/注销（nil）余额观察者。可在启动后任意时刻调用；
+// 观察者必须自身并发安全且快速返回——它在余额查询的调用栈上同步执行。
+func (c *Client) SetCreditObserver(fn CreditObserver) {
+	if c == nil {
+		return
+	}
+	if fn == nil {
+		c.creditObserver.Store(nil)
+		return
+	}
+	c.creditObserver.Store(&fn)
+}
+
+// notifyCredits 查询成功（err == nil）后旁路通知观察者。失败不是观测值：
+// 网络抖动返回的 0 余额若被留痕，会在下一次成功时造出一条假变动。
+func (c *Client) notifyCredits(a *auth.Auth, credits int64, err error) {
+	if c == nil || err != nil || a == nil {
+		return
+	}
+	fn := c.creditObserver.Load()
+	if fn == nil {
+		return
+	}
+	// 观察者是纯旁路：它 panic 绝不能打断余额刷新/签到这条主流程（调度器 goroutine
+	// 里未恢复的 panic 会直接带走整个进程）。与"落盘失败只记日志"同一哲学。
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("WARN: [upstream] 余额观察者 panic 已忽略: %v", r)
+		}
+	}()
+	(*fn)(a.UID, credits)
 }
 
 // respAccount 供 packageRemainUsed 解析的套餐字段（CreditPackages 的逐包结构同构）。

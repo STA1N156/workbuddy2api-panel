@@ -1,17 +1,24 @@
 'use strict';
 /* ── 状态 ─────────────────────────────────────────────────────────── */
 const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
+const LS_REMARKS = 'wb2api.remarks.v1';
+let remarksCache = null;
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
 let logPin = true, loginState = null, loginTimer = null;
 let refTimer = null;
+let overviewPending = null;
+let visibleRefreshing = false;
+const accFilter = { q: '', status: '', realm: '', sort: 'default', page: 1, size: 50 };
+let accountRenderKey = '';
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
 let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
 let mdAll = [], mdProbes = {}, mdProbeOf = () => undefined;
+let mdLocks = [], mdRecent = [];
 let reqFilter = { q: '', outcome: '' };
 let reqEntries = [];
-let usDim = 'account', usCreditDim = 'account', usSort = 'total';
+let usDim = 'model', usCreditDim = 'model', usSort = 'total';
 let usageData = null;
 let reqRangeState = null; // 请求记录的时间范围（用量页的见 trangeState）
 
@@ -259,13 +266,21 @@ function rateLimitMeta(row, now) {
       title: model + '\n模型当前不可用' + (deadline ? '\n最早重试：' + fmtLocalDateTime(deadline) : ''),
     };
   }
-  let detail = resetAt
-    ? '预计 ' + fmtLocalDateTime(resetAt) + ' 解封' + (remaining ? '（剩余 ' + dur(remaining) + '）' : '')
-    : (until ? '预计 ' + fmtLocalDateTime(until) + ' 恢复（剩余 ' + dur(remaining) + '）' : '预计解封时间未知');
   const title = [model, resetAt ? '上游重置：' + fmtLocalDateTime(resetAt) : '上游重置：时间未知'];
   if (until && resetAt && until < resetAt) {
-    detail += ' · 网关最快 ' + dur(Math.max(0, Math.round((until - now) / 1000))) + ' 后重试';
+    // 双时钟（issue #171 问题二）：黄框出现/消失由 until 决定（网关为防超长
+    // 限流拖死全池，把重试封顶在 now+softRateMax），主文字却按 resetAt 显示，
+    // 导致「写的解封时间」与「实际掉框时刻」不一致。此时主文字同时明示两个
+    // 时刻与口径，倒计时跟随 until（与实际掉框一致，也与「模型与档位」页
+    // 锁池表的 until 口径对齐）。
+    const retryIn = until > now ? Math.round((until - now) / 1000) : 0;
+    detail = '网关 ' + fmtLocalDateTime(until) + ' 起重试' + (retryIn ? '（剩余 ' + dur(retryIn) + '）' : '') +
+      ' · 上游称 ' + fmtLocalDateTime(resetAt) + ' 恢复';
     title.push('网关最早重试：' + fmtLocalDateTime(until));
+  } else {
+    detail = resetAt
+      ? '预计 ' + fmtLocalDateTime(resetAt) + ' 解封' + (remaining ? '（剩余 ' + dur(remaining) + '）' : '')
+      : (until ? '预计 ' + fmtLocalDateTime(until) + ' 恢复（剩余 ' + dur(remaining) + '）' : '预计解封时间未知');
   }
   return { model, kind, detail, title: title.join('\n') };
 }
@@ -330,28 +345,25 @@ $('btnKey').onclick = async () => {
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
-/* 积分包明细共享缓存：「积分构成」视图与首页「积分到期提醒」卡片共用同一份
-   /panel/api/packages 数据（逐账号实时查上游，能省一次是一次）。声明在路由区
-   是因为 go() 的初始调用就会触发首页卡片的渲染，必须先于它就位。 */
+/* 积分明细只在用户主动查询时加载。 */
 let lastPackages = null;
 let lastPackagesAt = 0;
-let expFetching = false;                       // 到期卡片在途标记（防重复打上游）
-const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟内复用
 
 const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const PAGE_DESCRIPTIONS = { accounts: '集中管理账号、余额与可用状态', usage: '查看请求趋势、Token 用量与积分消耗', packages: '按需查询积分来源与剩余明细', taskscenter: '查看签到、保活和批量任务的执行进度', models: '查找模型能力、可用状态与推理档位', config: '调整服务行为与账号调度策略', logs: '排查请求结果、运行事件与积分变动' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
   $('ttl').textContent = TITLES[v];
+  $('pageTitle').textContent = TITLES[v];
+  $('pageDescription').textContent = PAGE_DESCRIPTIONS[v];
+  if (v === 'accounts' && overviewData) renderAccounts(overviewData.accounts || []);
   if (v === 'models' && !$('mdBody').children.length) loadModels();
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
-  // 到期提醒卡片：默认可见，进页面即用 overview 快照渲染（零上游请求，随首页统计
-  // 每轮刷新）。不再「打开账号池就打上游」——逐账号实时查在账号多时会卡死面板。
-  // 完整逐包明细由卡片上的「检查」按钮显式触发（loadPackages/loadExpiry）。
   if (v === 'taskscenter') reattachQueueView();
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
@@ -367,14 +379,56 @@ setTimeout(() => {
 }, 0);
 
 /* ── 账号池 ───────────────────────────────────────────────────────── */
+function accountStatus(s, now = Date.now()) {
+  if (s.disabled) return 'disabled';
+  if (s.paused) return 'paused';
+  return s.cool_remaining_sec > 0 || Date.parse(s.breaker_until) > now || Date.parse(s.degrade_until) > now ? 'cooling' : 'healthy';
+}
+function accountPage(list) {
+  const q = accFilter.q.trim().toLocaleLowerCase();
+  const now = Date.now();
+  let rows = list.filter(s => (!accFilter.status || accountStatus(s, now) === accFilter.status)
+    && (!accFilter.realm || (s.realm || 'cn') === accFilter.realm)
+    && (!q || [s.nickname, s.uid, remarkOf(s.uid)].join(' ').toLocaleLowerCase().includes(q)));
+  if (accFilter.sort === 'credits') rows.sort((a, b) => (b.credits || 0) - (a.credits || 0));
+  if (accFilter.sort === 'recent') rows.sort((a, b) => (Date.parse(b.last_success) || 0) - (Date.parse(a.last_success) || 0));
+  const pages = Math.max(1, Math.ceil(rows.length / accFilter.size));
+  accFilter.page = Math.min(pages, Math.max(1, accFilter.page));
+  return { total: rows.length, pages, rows: rows.slice((accFilter.page - 1) * accFilter.size, accFilter.page * accFilter.size) };
+}
+function updateAccountFilter() {
+  accFilter.q = $('accSearch').value;
+  accFilter.status = $('accStatus').value;
+  accFilter.realm = $('accRealm').value;
+  accFilter.sort = $('accSort').value;
+  accFilter.size = Number($('accSize').value);
+  accFilter.page = 1;
+  renderAccounts(overviewData ? overviewData.accounts || [] : []);
+}
+['accSearch', 'accStatus', 'accRealm', 'accSort', 'accSize'].forEach(id => {
+  $(id).addEventListener(id === 'accSearch' ? 'input' : 'change', updateAccountFilter);
+});
+$('accPrev').onclick = () => { accFilter.page--; renderAccounts(overviewData ? overviewData.accounts || [] : []); };
+$('accNext').onclick = () => { accFilter.page++; renderAccounts(overviewData ? overviewData.accounts || [] : []); };
+
 function renderAccounts(list) {
   const tb = $('accBody');
+  const page = accountPage(list);
+  $('accCount').textContent = page.total + ' / ' + list.length + ' 个账号';
+  $('accPage').textContent = '第 ' + accFilter.page + ' / ' + page.pages + ' 页';
+  $('accPrev').disabled = accFilter.page <= 1;
+  $('accNext').disabled = accFilter.page >= page.pages;
+  const maxCred = Math.max(1, ...list.map(s => s.credits || 0));
+  list = page.rows;
+  // 后台快照未变化时保留现有 DOM，展开的操作菜单和键盘焦点不被轮询打断。
+  const key = JSON.stringify([list, maxCred, remarksAll(), Math.floor(Date.now() / (list.some(s => accountStatus(s) === 'cooling' || (s.rate_limited_models || []).length) ? 10000 : 60000))]);
+  if (key === accountRenderKey) return;
+  accountRenderKey = key;
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">暂无匹配账号</div>调整搜索条件，或点击右上角「添加账号」</div></td></tr>';
     return;
   }
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
-  const maxCred = Math.max(1, ...list.map(s => s.credits || 0));
   tb.innerHTML = list.map(s => {
     const bl = (new Date(s.breaker_until || 0) - Date.now()) / 1000;
     const dg = (new Date(s.degrade_until || 0) - Date.now()) / 1000;
@@ -388,7 +442,7 @@ function renderAccounts(list) {
         : (dg > (s.cool_remaining_sec || 0) ? '连败降权' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却'));
       tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
     } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
-    const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
+    const note = s.reason ? '<div class="account-reason" title="' + esc(s.reason) + '">' + esc(s.reason) + '</div>' : '';
     const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now());
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
     // 企业版不限量：上游 limitNum == -1，网关以 credits_total=-1 透出（见 upstream
@@ -423,7 +477,7 @@ function renderAccounts(list) {
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -435,7 +489,7 @@ function renderAccounts(list) {
         '<span class="usage-item usage-rate"><b>' + rate + '</b></span>' +
       '</span></td>' +
       '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
-      '<td class="acts">' +
+      '<td class="acts"><details class="row-menu"><summary>操作</summary><div class="row-menu-items">' +
         // 企业版无个人成长体系（签到 400「企业账号不支持该操作」/ 成长任务 403）：
         // 不渲染「签到」「任务」按钮，只留「额度」——点它走 /balance，企业额度由
         // upstream 的 get-enterprise-user-usage 口径填充。
@@ -449,7 +503,7 @@ function renderAccounts(list) {
                             : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="' + (s.enterprise ? '退出选号，但照常保活 / 刷新额度' : '退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额') + '">暂停选号</button>')) +
         (s.disabled ? '' : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
-      '</td></tr>';
+      '</div></details></td></tr>';
   }).join('');
 }
 
@@ -489,7 +543,12 @@ function renderModelLocks(rows) {
   }
 }
 
-async function loadOverview(quiet) {
+function loadOverview(quiet) {
+  if (overviewPending) return overviewPending;
+  overviewPending = fetchOverview(quiet).finally(() => { overviewPending = null; });
+  return overviewPending;
+}
+async function fetchOverview(quiet) {
   try {
     const d = await api('overview');
     overviewData = d;
@@ -512,11 +571,8 @@ async function loadOverview(quiet) {
     $('accNote').textContent = d.in_flight_full ? d.in_flight_full + ' 个账号在途占满' : '';
     const up = Math.floor(d.uptime_sec);
     $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
-    renderAccounts(d.accounts || []);
+    if (view === 'accounts') renderAccounts(d.accounts || []);
     renderModelLocks(d.model_locks);
-    // 到期卡片跟随首页统计同步刷新（用同一份响应里的到期快照，不额外发请求）。
-    // 已有逐包明细缓存时不再覆盖——明细信息量更大，别把它降级成快照。
-    if ($('expBox') && !lastPackages) renderExpirySnapshot(d);
   } catch (e) { if (!quiet) toast(e.message, 'err'); }
 }
 
@@ -526,6 +582,8 @@ $('accBody').addEventListener('click', async ev => {
   const u = b.dataset.u, a = b.dataset.a;
   if (a === 'remove' && !confirm('移除账号将删除池状态与 auths/ 下的凭证文件，且不可恢复。确认移除？')) return;
   if (a === 'disable' && !confirm('禁用后该账号不再参与选号（保号任务默认也跳过），需手动解冻才能恢复。若只是想临时让位、仍要保号，请改用「暂停选号」。确认禁用？')) return;
+  const menu = b.closest('details');
+  if (menu) menu.open = false;
   b.disabled = true;
   try {
     if (a === 'checkin') {
@@ -627,10 +685,18 @@ async function loadModels() {
   const tb = $('mdBody');
   tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
   try {
-    // 探测数据是可选增强：拉取失败不影响模型列表本身
-    const [d, pr] = await Promise.all([api('models'), api('model_probes').catch(() => ({}))]);
+    // 探测、模型锁与最近请求都是本地可选增强：任一失败不影响模型目录本身。
+    // 可用性标签不额外发推理请求，只用模型锁和最近真实请求结果合成。
+    const [d, pr, st, rm] = await Promise.all([
+      api('models'),
+      api('model_probes').catch(() => ({})),
+      api('status').catch(() => ({})),
+      api('request_metrics').catch(() => ({})),
+    ]);
     mdAll = d.models || [];
     mdProbes = pr.probes || {};
+    mdLocks = Array.isArray(st.model_locks) ? st.model_locks : [];
+    mdRecent = Array.isArray(rm.recent) ? rm.recent : [];
     if (!mdAll.length) {
       tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>';
       $('mdCount').textContent = '';
@@ -707,6 +773,67 @@ function mdSortList(list, f) {
   return out;
 }
 
+// mdAvailabilityOf 合成 Global 模型当前可用性：模型锁优先于最近请求结果。
+// 只返回有真实本地证据的状态；目录中存在但从未请求过的模型标为“待验证”，
+// 避免把“上游列出了模型”误当成“当前账号有权限”。
+function mdAvailabilityOf(m, locks, recent) {
+  const id = String((m && m.id) || '');
+  if (!id.startsWith('global:')) return null;
+  locks = Array.isArray(locks) ? locks : mdLocks;
+  recent = Array.isArray(recent) ? recent : mdRecent;
+  const bare = id.slice('global:'.length);
+  const lock = locks.find(r => r && r.realm === 'global' && r.model === bare);
+  if (lock) {
+    const reason = String(lock.reason || '').trim();
+    const lower = reason.toLowerCase();
+    if (lock.state === 'partial') {
+      return { key: 'partial', label: '部分可用', cls: 'warn',
+        tip: '仍有 ' + Number(lock.servable || 0) + ' 个 global 账号可服务；已锁 ' + Number(lock.locked || 0) + ' 个' + (reason ? '；' + reason : '') };
+    }
+    if (lock.state === 'starved') {
+      return { key: 'starved', label: '账号暂不可用', cls: 'mute',
+        tip: '没有账号能服务该模型，但并非该模型自身被锁；请检查账号冷却/在途占用' };
+    }
+    if (lower.startsWith('11158') || lower.includes('not allowed for user type')) {
+      return { key: 'denied', label: '无权限', cls: 'bad',
+        tip: '当前 global 账号类型不支持该模型' + (reason ? '；' + reason : '') };
+    }
+    if (lower.startsWith('11102') || lower.includes('service info not found')) {
+      return { key: 'missing', label: '上游无此模型', cls: 'bad',
+        tip: '上游目录残留，实际请求返回模型不存在' + (reason ? '；' + reason : '') };
+    }
+    return { key: 'limited', label: '限流/不可用', cls: 'warn',
+      tip: '模型级冷却中' + (reason ? '；' + reason : '') };
+  }
+  const ev = recent.find(e => e && e.model === id);
+  if (ev) {
+    const status = Number(ev.status || 0);
+    const when = ev.time ? new Date(ev.time).toLocaleString('zh-CN', { hour12: false }) : '';
+    if (ev.outcome === 'success' || (status >= 200 && status < 300)) {
+      return { key: 'ok', label: '可用', cls: 'ok',
+        tip: '最近一次真实请求成功' + (when ? ' · ' + when : '') };
+    }
+    if (status === 429) {
+      return { key: 'rate', label: '限流', cls: 'warn',
+        tip: '最近一次请求被限流' + (when ? ' · ' + when : '') };
+    }
+    if (status >= 500) {
+      return { key: 'upstream', label: '上游错误', cls: 'bad',
+        tip: '最近一次请求上游错误 HTTP ' + status + (when ? ' · ' + when : '') };
+    }
+    return { key: 'failed', label: '最近失败', cls: 'bad',
+      tip: '最近一次请求失败 HTTP ' + (status || '—') + (when ? ' · ' + when : '') };
+  }
+  return { key: 'unknown', label: '待验证', cls: 'mute',
+    tip: '尚无模型锁或近期真实请求记录；目录存在不代表当前账号有权限' };
+}
+
+function mdAvailabilityTag(m) {
+  const av = mdAvailabilityOf(m);
+  if (!av) return '';
+  return ' <span class="tag ' + av.cls + ' md-avail" title="' + esc(av.tip) + '">' + esc(av.label) + '</span>';
+}
+
 // mdRowHtml 单个模型行（纯渲染，便于独立测试）。
 function mdRowHtml(m, pr) {
   const eff = (m.supported_efforts || []).slice();
@@ -721,7 +848,7 @@ function mdRowHtml(m, pr) {
   if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag warn">思考常开</span>');
   const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
   const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
-  return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm">' + esc(m.id) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
+  return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm"><span class="mid">' + esc(m.id) + '</span>' + mdAvailabilityTag(m) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
     '<td class="num">' + rateCell(m) + '</td>' +
     '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
     '<td class="efs" style="white-space:normal">' + effs + '</td>' +
@@ -783,10 +910,11 @@ async function loadLogs() {
   const rq = trangeQuery('reqRange', false);
   rq.set('limit', limit);
   try {
-    const [d, metrics, requestRows] = await Promise.all([
+    const [d, metrics, requestRows, credit] = await Promise.all([
       api('logs'),
       api('request_metrics').catch(() => ({})),
       api('request_logs?' + rq.toString()).catch(() => ({ entries: [] })),
+      api('credit_history?limit=' + creditLimitValue()).catch(() => null),
     ]);
     // 归档开启时以归档为准——「区间内没有记录」是一个真实结果，不能回落成内存里
     // 的最近 100 条（那会把筛选条件之外、时间范围之外的请求显示出来）。
@@ -809,6 +937,7 @@ async function loadLogs() {
     $('logNote').textContent = logCh === 'all'
       ? '任务 ' + (counts.task || 0) + ' · 对话 ' + (counts.chat || 0) + ' · 系统 ' + (counts.sys || 0)
       : (logCh === 'task' ? '任务' : logCh === 'chat' ? '对话' : '系统') + ' ' + entries.length + ' 行';
+    renderCreditHistory(credit);
   } catch (e) { /* 概览已提示 */ }
 }
 
@@ -828,6 +957,78 @@ function renderRequestMetrics(m, entries) {
 
   reqEntries = entries || [];
   renderRequestTable();
+}
+
+/* ── 积分历史（每次真实查到余额与上次比对，变动即留痕）─────────────────
+   纯格式化函数集中在此，便于前端测试按切片断言；变动列 +N / −N（U+2212，
+   与请求记录一致），余额用千分位。 */
+function creditNum(n) {
+  return Number(n || 0).toLocaleString('zh-CN');
+}
+function creditDeltaText(delta) {
+  const d = Number(delta || 0);
+  if (d > 0) return '+' + creditNum(d);
+  if (d < 0) return '−' + creditNum(-d);
+  return '0';
+}
+function creditTimeText(e) {
+  if (!e || !e.time) return '—';
+  const d = new Date(e.time);
+  // 正常链路 time 由 Go 的 time.Time 序列化，恒为 RFC3339；这里挡的是手工改文件/
+  // 将来换格式等脏数据——toLocaleTimeString 遇到非法日期不抛异常，只会渲染出
+  // "Invalid Date" 这种没意义的字样。
+  return isNaN(d.getTime()) ? '—' : d.toLocaleTimeString('zh-CN', { hour12: false });
+}
+function creditAccountText(e) {
+  e = e || {};
+  return e.account ? String(e.account) : (e.uid || '—');
+}
+function creditBalanceText(e) {
+  return creditNum(e && e.after);
+}
+function creditDescText(e) {
+  return '余额 ' + creditNum(e && e.before) + ' → ' + creditNum(e && e.after);
+}
+function creditEntryText(e) {
+  return creditTimeText(e) + ' | ' + creditAccountText(e) + ' | ' + creditDeltaText(e && e.delta) +
+    ' | ' + creditBalanceText(e) + ' | ' + creditDescText(e);
+}
+function creditHistoryNote(entries) {
+  entries = entries || [];
+  if (!entries.length) return '暂无积分变动记录';
+  let net = 0;
+  for (const e of entries) net += Number(e && e.delta || 0);
+  return entries.length + ' 条 · 净 ' + (net > 0 ? '+' : net < 0 ? '−' : '') + creditNum(Math.abs(net));
+}
+function renderCreditHistory(d) {
+  const body = $('creditBody'), note = $('creditNote');
+  if (!body) return;
+  if (!d) {
+    if (note) note.textContent = '积分历史不可用';
+    body.innerHTML = '<tr><td colspan="5" style="color:var(--ink-3)">积分历史不可用</td></tr>';
+    return;
+  }
+  const entries = d.entries || [];
+  if (note) note.textContent = creditHistoryNote(entries);
+  body.innerHTML = entries.length
+    ? entries.map(e => '<tr>' +
+      '<td>' + esc(creditTimeText(e)) + '</td>' +
+      '<td>' + esc(creditAccountText(e)) + '</td>' +
+      '<td class="num">' + esc(creditDeltaText(e && e.delta)) + '</td>' +
+      '<td class="num">' + esc(creditBalanceText(e)) + '</td>' +
+      '<td>' + esc(creditDescText(e)) + '</td>' +
+      '</tr>').join('')
+    : '<tr><td colspan="5" style="color:var(--ink-3)">暂无积分变动记录</td></tr>';
+}
+function creditLimitValue() {
+  const el = $('creditLimit');
+  const n = el ? Number(el.value) : 100;
+  return n === 300 || n === 1000 ? n : 100;
+}
+async function loadCreditHistory() {
+  let d = null;
+  try { d = await api('credit_history?limit=' + creditLimitValue()); } catch (e) { d = null; }
+  renderCreditHistory(d);
 }
 
 /* reqMatch 请求记录筛选：q 对 IP/UA/模型/账号/请求 ID 做空格分词的 AND 包含匹配，
@@ -919,6 +1120,8 @@ if ($('btnReqReload')) $('btnReqReload').onclick = loadLogs;
 // 时间范围：默认「全部历史」——请求记录页的历史行为就是"取最近 N 条"，
 // 加一个默认收窄的区间会让打开页面时看到的条数凭空变少。
 if ($('reqRange')) trangeBind('reqRange', loadLogs, '0');
+if ($('creditLimit')) $('creditLimit').onchange = loadCreditHistory;
+if ($('btnCreditReload')) $('btnCreditReload').onclick = loadCreditHistory;
 
 function requestLogText(e) {
   const when = e && e.time ? new Date(e.time).toLocaleTimeString('zh-CN', { hour12: false }) : '—';
@@ -1203,32 +1406,43 @@ $('importFile').onchange = async () => {
 $('btnAdd').onclick = openAdd;
 $('btnRefresh').onclick = async () => {
   const b = $('btnRefresh');
-  b.disabled = true; b.textContent = '刷新中…';
+  b.disabled = true;
+  try {
+    if (view === 'usage') await loadUsage();
+    else if (view === 'models') await loadModels();
+    else if (view === 'config') await loadConfig();
+    else if (view === 'logs') await loadLogs();
+    else if (view === 'packages') await loadPackages(false);
+    else await loadOverview(false);
+  } finally { b.disabled = false; }
+};
+$('btnBalanceAll').onclick = async () => {
+  const b = $('btnBalanceAll');
+  b.disabled = true;
   try {
     await api('balance_all', { method: 'POST' });
     await loadOverview(true);
-    toast('余额已从上游刷新', 'ok');
-  } catch (e) { toast('刷新失败：' + e.message, 'err'); await loadOverview(true); }
-  finally { b.disabled = false; b.textContent = '刷新'; }
-  if (view === 'logs') loadLogs();
+    toast('余额刷新任务已提交', 'ok');
+  } catch (e) { toast('刷新失败：' + e.message, 'err'); }
+  finally { b.disabled = false; }
 };
 
-/* ── 轮询 ─────────────────────────────────────────────────────────── */
-function refreshVisible() {
-  if (view === 'accounts') loadOverview(true);
-  else if (view === 'logs') loadLogs();
-  else if (view === 'taskscenter') reattachQueueView();
+/* 后台标签页暂停轮询，同一轮刷新完成后才允许下一轮。 */
+async function refreshVisible() {
+  if (document.hidden || visibleRefreshing) return;
+  visibleRefreshing = true;
+  try {
+    if (view === 'accounts') await loadOverview(true);
+    else if (view === 'logs') await loadLogs();
+    else if (view === 'taskscenter') reattachQueueView();
+  } finally { visibleRefreshing = false; }
 }
 function start() {
   loadOverview(true);
   if (refTimer) clearInterval(refTimer);
-  refTimer = setInterval(refreshVisible, 5000);
-  checkAuthGate();
+  refTimer = setInterval(refreshVisible, 10000);
 }
-async function checkAuthGate() {
-  try { await api('overview'); }
-  catch (e) { if (String(e.message).includes('密钥') || String(e.message).includes('api_key')) return; }
-}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshVisible(); });
 start();
 
 /* ── 积分任务 ─────────────────────────────────────────────────────── */
@@ -1862,10 +2076,12 @@ function usPct(part, total) {
 
 /* usRow 生成一行。mid 是插在「名称」之后、请求数之前的额外单元格（如「域」列）。
    withPerf 控制延迟/速率两列；列开关显式传入，避免调用方改动后与表头错列。 */
-function usRow(name, sub, a, mid, withPerf) {
+/* nameHtml 非空时替代 esc(name)（已转义的富文本，见 remarkName）：账号维度的第一列
+   需要把备注渲染成主标识、uid8 作为浅色虚体跟随，其余维度仍走纯文本转义。 */
+function usRow(name, sub, a, mid, withPerf, nameHtml) {
   return '<tr>' +
     '<td class="mark" aria-hidden="true"></td>' +
-    '<td>' + esc(name) + (sub ? '<div class="note">' + esc(sub) + '</div>' : '') + '</td>' +
+    '<td>' + (nameHtml || esc(name)) + (sub ? '<div class="note">' + esc(sub) + '</div>' : '') + '</td>' +
     (mid || '') +
     '<td class="num">' + fmtTok(a.requests) + '</td>' +
     '<td class="num">' + (a.errors ? '<span style="color:var(--warn)">' + fmtTok(a.errors) + '</span>' : '—') + '</td>' +
@@ -1933,13 +2149,16 @@ function renderUsageDim() {
     realm: (d.by_realm || []).length,
   });
   $('usDimHead').innerHTML = usDimHead(usDim);
-  $('usDimBody').innerHTML = rows.map(x =>
-    usRow(usDim === 'account' ? String(x.key || '').slice(0, 8) : x.key,
-      usDim === 'account' ? (x.extra || '') : '',
+  $('usDimBody').innerHTML = rows.map(x => {
+    const isAcct = usDim === 'account';
+    const key = isAcct ? String(x.key || '').slice(0, 8) : x.key;
+    return usRow(key,
+      isAcct ? (x.extra || '') : '',
       x,
-      usDim === 'account' ? '<td class="num">' + esc(x.realm || '') + '</td>' : '',
-      m.withPerf)
-  ).join('') || '<tr><td colspan="' + m.span + '" class="empty">暂无数据</td></tr>';
+      isAcct ? '<td class="num">' + esc(x.realm || '') + '</td>' : '',
+      m.withPerf,
+      isAcct ? remarkName(x.key, esc(key)) : '');
+  }).join('') || '<tr><td colspan="' + m.span + '" class="empty">暂无数据</td></tr>';
   $('usDimNote').textContent = rows.length + ' 行 · 请求数含失败尝试';
 }
 
@@ -1990,7 +2209,7 @@ function renderCreditDim() {
       const account = row.nickname || uid.slice(0, 8) || '—';
       return '<tr>' +
         '<td class="mark" aria-hidden="true"></td>' +
-        '<td>' + esc(account) + '<div class="note">' + esc(row.realm || '') + ' · ' + esc(uid.slice(0, 8)) + '</div></td>' +
+        '<td>' + remarkName(uid, esc(account)) + '<div class="note">' + esc(row.realm || '') + ' · ' + esc(uid.slice(0, 8)) + '</div></td>' +
         '<td class="num">' + fmtTok(row.requests) + '</td>' +
         '<td class="num">' + fmtCredit(row.credits) + '</td>' +
         '<td class="num">' + fmtTok(row.credit_tokens) + '</td>' +
@@ -2736,13 +2955,16 @@ if ($('pkSort')) {
 }
 
 // loadPackages 按需拉取：有缓存（上次任意入口拉到的 packages 数据）先直接渲染，
-// 不再「切进积分构成页就打一次上游」——逐账号实时查询在账号多时既慢又压上游。
-// 无缓存（首次进入）才自动查一次；显式刷新（force=true，点「刷新」按钮）始终实时查。
+// 逐账号查询仅由「查询积分明细」触发，切换页面复用缓存。
 async function loadPackages(force) {
   if (!force && lastPackages) {
     renderPackages(lastPackages, lastDetailLimit);
     const ageMin = Math.floor((Date.now() - lastPackagesAt) / 60000);
     if (ageMin > 0) $('pkNote').textContent = lastPackages.accounts.length + ' 个账号 · ' + ageMin + ' 分钟前的数据，点「刷新」更新';
+    return;
+  }
+  if (!force) {
+    $('pkSummary').innerHTML = '<div class="empty">点击「查询积分明细」获取各账号积分包，账号较多时需要一些时间。</div>';
     return;
   }
   $('pkSummary').innerHTML = '<div class="empty">查询中…（逐账号向上游实时查询）</div>';
@@ -2753,7 +2975,7 @@ async function loadPackages(force) {
       api('packages'),
       api('config').catch(() => null),
     ]);
-    lastPackages = d;                            // 缓存供首页到期卡片与排序切换复用
+    lastPackages = d;                            // 缓存供页面切换与排序复用
     lastPackagesAt = Date.now();
     lastDetailLimit = pkDetailLimit(c && c.config);
     renderPackages(d, lastDetailLimit);
@@ -2763,172 +2985,73 @@ async function loadPackages(force) {
   }
 }
 
-/* ── 积分到期提醒（首页卡片）────────────────────────────────────────── */
-/* 积分不是永久的：签到/任务发的裂变包约一个月失效。只看「剩余积分 ÷ 日消耗」
-   会系统性偏乐观——用不完的部分到期直接蒸发。这里把「最近要过期的是哪批、
-   有多少、到期前每天要至少消耗多少」顶到首页，数据源与「积分构成」共用
-   （lastPackages 缓存，EXP_FRESH_MS 内复用，不重复打上游）。 */
-
-// expBatches 把某账号的包聚合成「到期日 → 该日作废积分」升序列表。
-// 只统计 remain>0 且有到期时间的包——没余额/长期包到期没有任何影响。
-function expBatches(packs) {
-  const byDay = new Map();
-  for (const p of packs || []) {
-    const r = Number(p.remain || 0);
-    const t = (p.end_time || '').slice(0, 10);
-    if (r <= 0 || !t) continue;
-    byDay.set(t, (byDay.get(t) || 0) + r);
-  }
-  return [...byDay.entries()]
-    .map(([date, remain]) => ({ date, remain }))
-    .sort((a, b) => (a.date < b.date ? -1 : 1));
-}
-
-function expDaysLeft(dateStr, today) {
-  return Math.round((new Date(dateStr + 'T00:00:00') - today) / 86400000);
-}
-
-function renderExpiry(d) {
-  const list = (d.accounts || []);
-  const today = new Date(); today.setHours(0, 0, 0, 0);
-  // 按「最近到期」升序排（issue #125）。
-  //
-  // 后端 /panel/api/packages 是按**余额降序**返回的，恰好把 CN 账号都排在前面、
-  // global 排在末尾，看起来像"按域分组"，其实只是余额顺序。这里再排一次，让
-  // "最快过期的排最前"这个唯一重要的顺序成立，且不分域。
-  //
-  // 排序键用最早到期批次的日期（expBatches 已按日期升序，故 [0] 即最早）。
-  // 查询失败的账号、以及 7 天内无到期的账号没有可比较的到期时间，统一排在最后，
-  // 保持它们原本的相对顺序（稳定排序）。
-  const keyed = list.map(a => {
-    let key = null;
-    if (!a.error) {
-      const bs = expBatches(a.packages).filter(b => expDaysLeft(b.date, today) >= 0);
-      if (bs.length) key = bs[0].date;
-    }
-    return { a, key };
-  });
-  keyed.sort((x, y) => {
-    if (x.key === y.key) return 0;
-    if (x.key === null) return 1;
-    if (y.key === null) return -1;
-    return x.key < y.key ? -1 : 1;
-  });
-  const rows = keyed.map(({ a }) => {
-    if (a.error) {
-      return '<div class="exp-row"><span class="exp-dot" style="background:var(--ink-3)"></span>' +
-        '<span class="exp-nm">' + esc(a.nickname || a.uid.slice(0, 8)) + '</span>' +
-        '<span class="exp-main err">查询失败：' + esc(a.error) + '</span></div>';
-    }
-    const bs = expBatches(a.packages).filter(b => expDaysLeft(b.date, today) >= 0);
-    if (!bs.length) {
-      return '<div class="exp-row"><span class="exp-dot" style="background:var(--ok)"></span>' +
-        '<span class="exp-nm">' + esc(a.nickname || a.uid.slice(0, 8)) + '</span>' +
-        '<span class="exp-main">7 天内无到期积分</span></div>';
-    }
-    const first = bs[0];
-    const days = expDaysLeft(first.date, today);
-    const daily = Math.ceil(first.remain / Math.max(1, days));
-    const week = bs.filter(b => expDaysLeft(b.date, today) <= 7)
-      .reduce((s, b) => s + b.remain, 0);
-    // 危险度：≤3 天红（不抓紧就真没了）、≤7 天琥珀、更远绿。
-    // 上游扣包是 FEFO（按失效时刻升序，实测两号口径一致）：这些快过期批次正是
-    // 被消耗得最快的，日均需耗给的是「哪怕单靠这个账号的自然流量也能对齐」的参照。
-    const cls = days <= 3 ? 'var(--bad)' : days <= 7 ? 'var(--warn)' : 'var(--ok)';
-    const dayWord = days === 0 ? '今天到期' : days === 1 ? '明天到期' : days + ' 天后到期';
-    const more = bs.length > 4 ? '　等 ' + bs.length + ' 批' : '';
-    const rest = bs.slice(1, 4).map(b =>
-      '随后 ' + esc(b.date.slice(5)) + ' · ' + fmtTok(b.remain)).join('　') + more;
-    return '<div class="exp-row"><span class="exp-dot" style="background:' + cls + '"></span>' +
-      '<span class="exp-nm">' + esc(a.nickname || a.uid.slice(0, 8)) + '</span>' +
-      '<span class="exp-main">最近到期 <b>' + esc(first.date) + '</b>（' + dayWord +
-      '）· 该批 <b>' + fmtTok(first.remain) + '</b> 积分 · 到期前日均需耗 ≥<b>' +
-      fmtTok(daily) + '</b>' +
-      (week > first.remain ? ' · 7 天内合计 ' + fmtTok(week) : '') +
-      (rest ? '<div class="note">' + rest + '</div>' : '') +
-      '</span></div>';
-  }).join('');
-  $('expList').innerHTML = rows || '<div class="empty">没有账号</div>';
-  // 数据新鲜度透明化：走缓存时标注年龄，免得把旧数据误当实时。
-  const ageMin = lastPackages ? Math.floor((Date.now() - lastPackagesAt) / 60000) : 0;
-  $('expNote').textContent = (lastPackagesAt && ageMin > 0)
-    ? list.length + ' 个账号 · ' + ageMin + ' 分钟前的数据，可点「检查」刷新'
-    : list.length + ' 个账号 · 实时查询上游';
-  $('expBox').hidden = false;
-}
-
-/* 快照版到期提醒：不查上游，直接用 /overview 已有的 credits_earliest_expiry /
-   credits_earliest_remaining（由签到与余额后台刷新写入 state.json，默认每 5 分钟
-   更新一次）。打开面板即可看到「最近哪批要过期」，成本与首页统计条相同为零。
-
-   与 renderExpiry（逐包明细版）的差异：这里只有**最早一批**的日期与数量，没有
-   后续批次、也没法算「7 天内合计」——那是 packages 接口才有的信息。因此卡片上
-   保留「检查」按钮作为增强入口，用户想要完整明细再显式触发一次上游查询。 */
-function renderExpirySnapshot(d) {
-  const list = (d && d.accounts) || [];
-  const today = new Date(); today.setHours(0, 0, 0, 0);
-  const keyed = list.map(a => {
-    // 后端给的是 RFC3339 带时区；无到期信息（长期包/未刷新）的账号排在最后。
-    let key = null, ms = 0;
-    if (a.credits_earliest_expiry) {
-      const t = new Date(a.credits_earliest_expiry);
-      if (!isNaN(t.getTime())) { ms = t.getTime(); key = ms; }
-    }
-    return { a, key, ms };
-  });
-  keyed.sort((x, y) => {
-    if (x.key === null && y.key === null) return 0;
-    if (x.key === null) return 1;
-    if (y.key === null) return -1;
-    return x.key - y.key;
-  });
-  const rows = keyed.map(({ a, ms }) => {
-    const nm = esc(a.nickname || String(a.uid || '').slice(0, 8));
-    if (!ms || !a.credits_earliest_remaining) {
-      return '<div class="exp-row"><span class="exp-dot" style="background:var(--ok)"></span>' +
-        '<span class="exp-nm">' + nm + '</span>' +
-        '<span class="exp-main">无近期到期批次</span></div>';
-    }
-    const days = Math.max(0, Math.ceil((ms - today.getTime()) / 86400000));
-    const remain = Number(a.credits_earliest_remaining || 0);
-    const daily = Math.ceil(remain / Math.max(1, days));
-    const cls = days <= 3 ? 'var(--bad)' : days <= 7 ? 'var(--warn)' : 'var(--ok)';
-    const dayWord = days === 0 ? '今天到期' : days === 1 ? '明天到期' : days + ' 天后到期';
-    const when = new Date(ms).toISOString().slice(0, 10);
-    return '<div class="exp-row"><span class="exp-dot" style="background:' + cls + '"></span>' +
-      '<span class="exp-nm">' + nm + '</span>' +
-      '<span class="exp-main">最近到期 <b>' + esc(when) + '</b>（' + dayWord +
-      '）· 该批 <b>' + fmtTok(remain) + '</b> 积分 · 到期前日均需耗 ≥<b>' +
-      fmtTok(daily) + '</b>' +
-      '<div class="note">仅最早一批，点「检查」看全部到期批次</div>' +
-      '</span></div>';
-  }).join('');
-  $('expList').innerHTML = rows || '<div class="empty">没有账号</div>';
-  $('expNote').textContent = list.length + ' 个账号 · 快照（来自本地状态，点「检查」拉实时明细）';
-  $('expBox').hidden = false;
-}
-
-async function loadExpiry(force) {
-  if (!$('expBox')) return;
-  if (expFetching) return;
-  const fresh = lastPackages && (Date.now() - lastPackagesAt) < EXP_FRESH_MS;
-  if (fresh && !force) { renderExpiry(lastPackages); return; }
-  expFetching = true;
-  $('expBox').hidden = false;
-  if (!$('expList').children.length) $('expList').innerHTML = '<div class="empty">查询中…（逐账号向上游实时查询）</div>';
-  $('expNote').textContent = '查询中…';
-  try {
-    const d = await api('packages');
-    lastPackages = d;                            // 与「积分构成」视图共用同一份缓存
-    lastPackagesAt = Date.now();
-    renderExpiry(d);
-  } catch (e) {
-    $('expNote').textContent = '查询失败：' + esc(e.message);
-  }
-  expFetching = false;
-}
-
-if ($('btnExp')) $('btnExp').onclick = () => loadExpiry(true);
-
 // 「刷新」始终实时查（显式 force，不依赖事件对象真值）
 if ($('btnPk')) $('btnPk').onclick = () => loadPackages(true);
+
+/* ══ 账号备注（只写本机 localStorage；账号池 / 用量两个视图共用同一份映射）══════
+   键取 uid 前 8 位——与 renderUsageDim 账号维度的 key 和积分扣除表的 uid 前缀同源，
+   三个表格因此都能直接 join。展示层只替换文本并挂 .rm-ghost 虚体，账号标识本身
+   仍由服务端下发，不写回后端；备注是纯展示层信息，不参与选号 / 计费 / 鉴权。 */
+function remarksAll() {
+  if (remarksCache) return remarksCache;
+  try { remarksCache = JSON.parse(localStorage.getItem(LS_REMARKS)) || {}; }
+  catch (e) { remarksCache = {}; }
+  return remarksCache;
+}
+function remarkKey(uid) { return String(uid == null ? '' : uid).slice(0, 8); }
+function remarkOf(uid) {
+  const k = remarkKey(uid);
+  return k ? String(remarksAll()[k] || '') : '';
+}
+/* nameHtml 必须是已转义的 HTML；有备注时返回「备注 + 原标识（浅色虚体）」 */
+function remarkName(uid, nameHtml) {
+  const r = remarkOf(uid);
+  return r ? esc(r) + '<span class="rm-ghost">' + nameHtml + '</span>' : nameHtml;
+}
+function storeRemarks(map) {
+  remarksCache = map;
+  try { localStorage.setItem(LS_REMARKS, JSON.stringify(map)); } catch (e) {}
+}
+
+/* 编辑器的行来自 overview 缓存（账号池加载过就有），另外补上「已有备注但当前列表里
+   没有」的键，避免账号被移除后备注看起来凭空消失。 */
+function remarkFormRows() {
+  const rows = ((overviewData && overviewData.accounts) || [])
+    .map(s => ({ uid: remarkKey(s.uid), who: s.nickname || remarkKey(s.uid) }))
+    .filter(r => r.uid);
+  for (const k of Object.keys(remarksAll())) {
+    if (!rows.some(r => r.uid === k)) rows.push({ uid: k, who: k });
+  }
+  return rows;
+}
+function renderRemarkBody() {
+  const box = $('remarkBody');
+  if (!box) return;
+  const rows = remarkFormRows();
+  box.innerHTML = rows.length
+    ? rows.map(r => '<div class="rm-row"><span class="rm-who" title="' + esc(r.who) + '">' + esc(r.who) + '</span>' +
+        '<input type="text" data-uid="' + esc(r.uid) + '" value="' + esc(remarksAll()[r.uid] || '') + '" placeholder="备注（留空即清除）" maxlength="24"></div>').join('')
+    : '<div class="empty">暂无账号：先在「账号池」加载一次账号列表。</div>';
+}
+function openRemarks() {
+  renderRemarkBody();
+  if ($('remarkVeil')) $('remarkVeil').classList.add('on');
+}
+function closeRemarks() { if ($('remarkVeil')) $('remarkVeil').classList.remove('on'); }
+function saveRemarkForm() {
+  const map = {};
+  document.querySelectorAll('#remarkBody input[data-uid]').forEach(inp => {
+    const v = inp.value.trim();
+    if (v) map[inp.getAttribute('data-uid')] = v;
+  });
+  storeRemarks(map);
+  closeRemarks();
+  // 备注只影响本机展示。
+  if (view === 'accounts' && overviewData) renderAccounts(overviewData.accounts || []);
+  else if (view === 'usage' && usageData) renderUsage(usageData);
+  toast('备注已保存（仅本机浏览器）');
+}
+if ($('btnRemarks')) $('btnRemarks').onclick = openRemarks;
+if ($('btnRemarkClose')) $('btnRemarkClose').onclick = closeRemarks;
+if ($('btnRemarkClear')) $('btnRemarkClear').onclick = () => { storeRemarks({}); renderRemarkBody(); };
+if ($('btnRemarkSave')) $('btnRemarkSave').onclick = saveRemarkForm;
