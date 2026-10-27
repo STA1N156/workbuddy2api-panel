@@ -165,6 +165,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
 	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.withAuth(p.importCockpit))
+	p.mux.HandleFunc("POST /panel/api/proxies", p.withAuth(p.accountProxies))
+	p.mux.HandleFunc("POST /panel/api/proxies/check", p.withAuth(p.checkAccountProxies))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/pause", p.withAuth(p.accountPause))
@@ -240,6 +242,10 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	// 用 WithPaused 而不是 CountsDetailed：后者把暂停号并进 disabled（/status 的
 	// 「不可用」口径），而概况卡片要分开展示（issue #125）。
 	total, healthy, cooling, disabled, paused, inFlightFull := p.cfg.Pool.CountsDetailedWithPaused()
+	var proxies map[string]string
+	if p.cfg.Upstream != nil {
+		proxies = p.cfg.Upstream.ProxyLabels()
+	}
 	sticky := 0
 	if p.cfg.StickyCount != nil {
 		sticky = p.cfg.StickyCount()
@@ -257,6 +263,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"paused":          paused,
 		"in_flight_full":  inFlightFull,
 		"accounts":        p.cfg.Pool.List(),
+		"proxies":         proxies,
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
 		// 与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
 		"model_locks": p.cfg.Pool.ModelLockView(),
@@ -642,6 +649,12 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 // accountRemove 移除账号：先出池（立即落盘 state），再删 auth 文件。
 func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
+	if p.cfg.Upstream != nil && p.cfg.Upstream.ProxyLabels()[uid] != "" {
+		if err := p.cfg.Upstream.SetAccountProxies(map[string]string{uid: ""}); err != nil {
+			writeErr(w, 500, "无法移除账号代理配置")
+			return
+		}
+	}
 	a := p.cfg.Pool.Remove(uid)
 	if a == nil {
 		writeErr(w, http.StatusNotFound, "account not found")

@@ -12,6 +12,7 @@ let overviewPending = null;
 let visibleRefreshing = false;
 const accFilter = { q: '', status: '', realm: '', sort: 'default', page: 1, size: 50 };
 let accountRenderKey = '';
+let proxyScopeUIDs = [], proxyChecks = {}, proxyBusy = false;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
 let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
 let mdAll = [], mdProbes = {}, mdProbeOf = () => undefined;
@@ -394,7 +395,7 @@ function accountPage(list) {
   if (accFilter.sort === 'recent') rows.sort((a, b) => (Date.parse(b.last_success) || 0) - (Date.parse(a.last_success) || 0));
   const pages = Math.max(1, Math.ceil(rows.length / accFilter.size));
   accFilter.page = Math.min(pages, Math.max(1, accFilter.page));
-  return { total: rows.length, pages, rows: rows.slice((accFilter.page - 1) * accFilter.size, accFilter.page * accFilter.size) };
+  return { total: rows.length, pages, all: rows, rows: rows.slice((accFilter.page - 1) * accFilter.size, accFilter.page * accFilter.size) };
 }
 function updateAccountFilter() {
   accFilter.q = $('accSearch').value;
@@ -421,7 +422,7 @@ function renderAccounts(list) {
   const maxCred = Math.max(1, ...list.map(s => s.credits || 0));
   list = page.rows;
   // 后台快照未变化时保留现有 DOM，展开的操作菜单和键盘焦点不被轮询打断。
-  const key = JSON.stringify([list, maxCred, remarksAll(), Math.floor(Date.now() / (list.some(s => accountStatus(s) === 'cooling' || (s.rate_limited_models || []).length) ? 10000 : 60000))]);
+  const key = JSON.stringify([list, maxCred, remarksAll(), overviewData && overviewData.proxies, Math.floor(Date.now() / (list.some(s => accountStatus(s) === 'cooling' || (s.rate_limited_models || []).length) ? 10000 : 60000))]);
   if (key === accountRenderKey) return;
   accountRenderKey = key;
   if (!list.length) {
@@ -444,6 +445,7 @@ function renderAccounts(list) {
     } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
     const note = s.reason ? '<div class="account-reason" title="' + esc(s.reason) + '">' + esc(s.reason) + '</div>' : '';
     const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now());
+    const connection = overviewData && overviewData.proxies && overviewData.proxies[s.uid];
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
     // 企业版不限量：上游 limitNum == -1，网关以 credits_total=-1 透出（见 upstream
     // enterpriseUnlimitedTotal）。此时剩余额度不参与展示，直接标「不限」。
@@ -477,7 +479,7 @@ function renderAccounts(list) {
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div><div class="note" style="font-size:10px" title="' + esc(connection || '服务器直连') + '">' + esc(connection || '直连') + '</div></td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -490,6 +492,7 @@ function renderAccounts(list) {
       '</span></td>' +
       '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
       '<td class="acts"><details class="row-menu"><summary>操作</summary><div class="row-menu-items">' +
+        '<button class="xs ghost" data-a="proxy" data-u="' + esc(s.uid) + '">代理</button>' +
         // 企业版无个人成长体系（签到 400「企业账号不支持该操作」/ 成长任务 403）：
         // 不渲染「签到」「任务」按钮，只留「额度」——点它走 /balance，企业额度由
         // upstream 的 get-enterprise-user-usage 口径填充。
@@ -580,6 +583,7 @@ $('accBody').addEventListener('click', async ev => {
   const b = ev.target.closest('button[data-a]');
   if (!b) return;
   const u = b.dataset.u, a = b.dataset.a;
+  if (a === 'proxy') { openProxies([u]); return; }
   if (a === 'remove' && !confirm('移除账号将删除池状态与 auths/ 下的凭证文件，且不可恢复。确认移除？')) return;
   if (a === 'disable' && !confirm('禁用后该账号不再参与选号（保号任务默认也跳过），需手动解冻才能恢复。若只是想临时让位、仍要保号，请改用「暂停选号」。确认禁用？')) return;
   const menu = b.closest('details');
@@ -3055,3 +3059,78 @@ if ($('btnRemarks')) $('btnRemarks').onclick = openRemarks;
 if ($('btnRemarkClose')) $('btnRemarkClose').onclick = closeRemarks;
 if ($('btnRemarkClear')) $('btnRemarkClear').onclick = () => { storeRemarks({}); renderRemarkBody(); };
 if ($('btnRemarkSave')) $('btnRemarkSave').onclick = saveRemarkForm;
+
+/* 代理绑定按账号保存；编辑区只接收用户粘贴的代理，不回显已保存密码。 */
+function selectedProxyUIDs() {
+  const bindings = overviewData && overviewData.proxies || {};
+  return proxyScopeUIDs.filter(uid => !$('proxyOnlyUnbound').checked || !bindings[uid]);
+}
+function renderProxyRows() {
+  const bindings = overviewData && overviewData.proxies || {};
+  const accounts = new Map(((overviewData && overviewData.accounts) || []).map(a => [a.uid, a]));
+  const selected = selectedProxyUIDs();
+  $('proxyScope').textContent = '范围：当前筛选的 ' + proxyScopeUIDs.length + ' 个账号；本次操作 ' + selected.length + ' 个。';
+  const ipCounts = {};
+  for (const r of Object.values(proxyChecks)) if (r.ip) ipCounts[r.ip] = (ipCounts[r.ip] || 0) + 1;
+  $('proxyRows').innerHTML = selected.map(uid => {
+    const a = accounts.get(uid) || {}, r = proxyChecks[uid];
+    const result = r ? (r.error || (r.ip + ' · ' + r.milliseconds + ' ms' + (ipCounts[r.ip] > 1 ? ' · 出口 IP 重复' : ''))) : '—';
+    return '<tr><td>' + esc(a.nickname || uid) + '<div class="note">' + esc(uid) + '</div></td><td>' + esc(bindings[uid] || '直连') + '</td><td>' + esc(result) + '</td></tr>';
+  }).join('') || '<tr><td colspan="3" class="empty">没有符合条件的账号，取消“只给未绑定的账号”可查看现有绑定。</td></tr>';
+}
+function openProxies(uids) {
+  proxyScopeUIDs = uids;
+  proxyChecks = {};
+  $('proxyOnlyUnbound').checked = !uids.some(uid => overviewData && overviewData.proxies && overviewData.proxies[uid]);
+  $('proxyInput').value = '';
+  $('proxyNote').textContent = '';
+  renderProxyRows();
+  $('proxyVeil').classList.add('on');
+}
+async function saveProxyBindings(clear) {
+  if (proxyBusy) return;
+  const uids = selectedProxyUIDs();
+  if (!uids.length) return toast('没有可操作的账号', 'err');
+  const lines = $('proxyInput').value.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  if (!clear && lines.length !== uids.length) return toast('需要 ' + uids.length + ' 行代理地址，目前有 ' + lines.length + ' 行', 'err');
+  if (!clear && new Set(lines).size !== lines.length) return toast('代理地址重复，请为每个账号提供独立代理', 'err');
+  if (clear && !confirm('解绑所选的 ' + uids.length + ' 个账号后，这些账号将使用服务器直连。继续？')) return;
+  proxyBusy = true;
+  try {
+    const d = await api('proxies', { method: 'POST', body: JSON.stringify({ bindings: uids.map((uid, i) => ({uid, proxy_url: clear ? '' : lines[i]})) }) });
+    if (overviewData) overviewData.proxies = d.proxies;
+    $('proxyInput').value = '';
+    $('proxyOnlyUnbound').checked = false;
+    proxyChecks = {};
+    renderProxyRows();
+    renderAccounts(overviewData.accounts || []);
+    $('proxyNote').textContent = '已保存 ' + d.updated + ' 个账号。绑定即时生效；连接失败的账号会暂停选号，可在修复后手动恢复。';
+    toast('代理绑定已保存', 'ok');
+  } catch (e) { toast(e.message, 'err'); }
+  finally { proxyBusy = false; }
+}
+async function checkProxyBindings() {
+  if (proxyBusy) return;
+  const bindings = overviewData && overviewData.proxies || {};
+  const uids = selectedProxyUIDs().filter(uid => bindings[uid]);
+  if (!uids.length) return toast('请先绑定代理，或取消“只给未绑定的账号”', 'err');
+  proxyBusy = true;
+  $('proxyNote').textContent = '正在检测代理出口…';
+  let checked = 0, failed = 0;
+  try {
+    for (let i = 0; i < uids.length; i += 4) {
+      const d = await api('proxies/check', { method:'POST', body:JSON.stringify({uids:uids.slice(i,i+4)}) });
+      for (const r of d.results || []) { proxyChecks[r.uid] = r; checked++; if (r.error) failed++; }
+      renderProxyRows();
+      $('proxyNote').textContent = '已检测 ' + checked + ' / ' + uids.length + '，失败 ' + failed + '。出口 IP 重复时会标注；检测不会自动恢复暂停账号。';
+    }
+    await loadOverview(true);
+  } catch (e) { $('proxyNote').textContent = '检测中断：' + e.message; }
+  finally { proxyBusy = false; }
+}
+$('btnProxies').onclick = () => openProxies(accountPage(overviewData && overviewData.accounts || []).all.map(a => a.uid));
+$('proxyOnlyUnbound').onchange = renderProxyRows;
+$('btnProxyClose').onclick = () => $('proxyVeil').classList.remove('on');
+$('btnProxySave').onclick = () => saveProxyBindings(false);
+$('btnProxyClear').onclick = () => saveProxyBindings(true);
+$('btnProxyCheck').onclick = checkProxyBindings;

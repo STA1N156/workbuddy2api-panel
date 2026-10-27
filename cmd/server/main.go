@@ -32,7 +32,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.13.0-panel.1"
+const appVersion = "1.13.0-panel.2"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -133,6 +133,10 @@ func main() {
 	}
 
 	up := upstream.New()
+	if err := up.LoadAccountProxies(stateSibling(cfg.StateFile, "account_proxies.json")); err != nil {
+		log.Fatalf("load account proxies: %v", err)
+	}
+	up.ProxyFailure = func(uid string) { p.Pause(uid); log.Printf("账号 %s 代理连接失败，已暂停选号", uid) }
 
 	// 积分保底的「收费」兜底判据：接上游模型目录的积分倍率表。本地实测台账无观测
 	// 时用它判收费——否则「没学过」恒等于「放行」，高价新模型会把触底号一笔打穿

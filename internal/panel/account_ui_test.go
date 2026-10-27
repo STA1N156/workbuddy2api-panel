@@ -46,6 +46,7 @@ context.rateLimitRowsHtml = () => '';
 context.esc = value => String(value == null ? '' : value).replace(/</g,'&lt;').replace(/>/g,'&gt;');
 for (const name of ['dur','formatTokenCount','formatLatency','formatRate','ago']) context[name] = value => String(value || 0);
 context.accountRenderKey = '';
+context.overviewData = null;
 context.Date = class extends Date { static now() { return 1800000000000; } };
 vm.runInContext(source.slice(source.indexOf('function renderAccounts('), source.indexOf('// renderModelLocks')), context);
 context.renderAccounts(rows);

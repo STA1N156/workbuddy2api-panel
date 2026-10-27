@@ -697,6 +697,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <h3>账号列表 <span class="hint" id="accCount"></span></h3>
           <span class="grow"></span>
           <span class="note" id="accNote"></span>
+          <button class="xs" id="btnProxies">账号代理</button>
           <button class="xs" id="btnRemarks">账号备注</button>
           <details class="bulk-menu"><summary>批量操作</summary><div class="bulk-menu-items">
             <button class="xs" id="btnBalanceAll">刷新全部余额</button>
@@ -1348,6 +1349,22 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   </div>
 </div>
 
+<div class="veil" id="proxyVeil">
+  <div class="dlg" style="width:780px">
+    <header><h3>账号代理</h3><div class="hint">固定绑定 · HTTP / HTTPS / SOCKS5 · 代理连接失败时暂停该账号</div></header>
+    <div class="body">
+      <div class="note" id="proxyScope"></div>
+      <label class="inline" style="margin:12px 0"><input type="checkbox" id="proxyOnlyUnbound" checked>只给未绑定的账号分配代理</label>
+      <label class="fld"><span class="lb">每行一个代理，按下方账号顺序一一绑定</span>
+        <textarea id="proxyInput" rows="5" autocomplete="off" spellcheck="false" placeholder="http://用户名:密码@主机:端口&#10;socks5://用户名:密码@主机:端口" style="width:100%;padding:10px;background:var(--surface-2);color:var(--ink);border:1px solid var(--line);border-radius:7px"></textarea>
+      </label>
+      <div class="note">未绑定的账号保持直连；代理密码不会回显。可先在账号列表筛选，再打开此窗口批量操作。</div>
+      <div class="tbl-wrap" style="max-height:300px;overflow:auto;margin-top:12px"><table class="acc"><thead><tr><th>账号 / UID</th><th>当前连接</th><th>检测结果</th></tr></thead><tbody id="proxyRows"></tbody></table></div>
+      <div class="note" id="proxyNote" role="status" style="margin-top:12px"></div>
+    </div>
+    <footer style="flex-wrap:wrap"><button class="danger" id="btnProxyClear">解绑所选账号</button><button id="btnProxyCheck">检测所选代理</button><span class="grow"></span><button id="btnProxyClose">关闭</button><button class="primary" id="btnProxySave">保存绑定</button></footer>
+  </div>
+</div>
 <div id="toasts"></div>
 
 <script src="app.js"></script>
