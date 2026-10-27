@@ -11,27 +11,29 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 // cockpitAccount 映射 cockpit tools 导出格式的单个账号。
 type cockpitAccount struct {
-	ID            string `json:"id"`
-	Email         string `json:"email"`
-	UID           string `json:"uid"`
-	Nickname      string `json:"nickname"`
-	AccessToken   string `json:"access_token"`
-	RefreshToken  string `json:"refresh_token"`
-	TokenType     string `json:"token_type"`
-	ExpiresAt     int64  `json:"expires_at"`
-	Domain        string `json:"domain"`
-	DosageNotify  string `json:"dosage_notify_code"`
-	PaymentType   string `json:"payment_type"`
-	Status        string `json:"status"`
-	UsageUpdatedAt int64 `json:"usage_updated_at"`
-	LastCheckin   int64  `json:"last_checkin_time"`
-	CheckinStreak int    `json:"checkin_streak"`
-	CreatedAt     int64  `json:"created_at"`
-	LastUsed      int64  `json:"last_used"`
+	ID             string `json:"id"`
+	Email          string `json:"email"`
+	UID            string `json:"uid"`
+	Nickname       string `json:"nickname"`
+	AccessToken    string `json:"access_token"`
+	RefreshToken   string `json:"refresh_token"`
+	TokenType      string `json:"token_type"`
+	ExpiresAt      int64  `json:"expires_at"`
+	Domain         string `json:"domain"`
+	DosageNotify   string `json:"dosage_notify_code"`
+	PaymentType    string `json:"payment_type"`
+	Status         string `json:"status"`
+	UsageUpdatedAt int64  `json:"usage_updated_at"`
+	LastCheckin    int64  `json:"last_checkin_time"`
+	CheckinStreak  int    `json:"checkin_streak"`
+	CreatedAt      int64  `json:"created_at"`
+	LastUsed       int64  `json:"last_used"`
+	ProxyURL       string `json:"proxy_url"`
 }
 
 // importCockpit 接收 cockpit tools 导出的 JSON 文件，批量导入账号到池中。
@@ -70,6 +72,34 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var total, imported, skipped int
+	// Bind first: activation, trial, balance and any concurrent chat must use the proxy.
+	bindings := map[string]string{}
+	for _, acc := range accounts {
+		if strings.TrimSpace(acc.ProxyURL) == "" {
+			continue
+		}
+		uid := strings.TrimSpace(acc.UID)
+		if !validImportUID(uid) || strings.TrimSpace(acc.AccessToken) == "" || strings.TrimSpace(acc.RefreshToken) == "" {
+			writeErr(w, http.StatusBadRequest, "代理绑定账号缺少有效凭证或 UID")
+			return
+		}
+		proxy, err := upstream.NormalizeProxyURL(acc.ProxyURL)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if _, exists := bindings[uid]; exists {
+			writeErr(w, http.StatusBadRequest, "导入账号重复")
+			return
+		}
+		bindings[uid] = proxy
+	}
+	if len(bindings) > 0 {
+		if err := p.cfg.Upstream.SetAccountProxies(bindings); err != nil {
+			writeErr(w, http.StatusBadRequest, "导入代理绑定失败："+err.Error())
+			return
+		}
+	}
 	var errs []string
 
 	for _, acc := range accounts {
