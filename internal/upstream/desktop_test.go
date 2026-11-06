@@ -40,8 +40,8 @@ func TestReportDesktopEventFingerprint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("report desktop: %v", err)
 	}
-	if gotUA != desktopUA {
-		t.Errorf("UA=%q want %q", gotUA, desktopUA)
+	if want := c.userAgent(&auth.Auth{}); gotUA != want {
+		t.Errorf("UA=%q want %q", gotUA, want)
 	}
 	if len(got) != 1 {
 		t.Fatalf("events=%d want 1", len(got))
@@ -98,11 +98,12 @@ func TestDesktopChatSequenceShape(t *testing.T) {
 // TestSetAppearanceTheme 断言主题设置端点形状（点亮 Hp_Appearance 的 API）。
 func TestSetAppearanceTheme(t *testing.T) {
 	var got map[string]any
+	c := &Client{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v2/user-asset/appearance/set" {
 			t.Errorf("path=%s want /v2/user-asset/appearance/set", r.URL.Path)
 		}
-		if r.Header.Get("User-Agent") != desktopUA {
+		if r.Header.Get("User-Agent") != c.userAgent(&auth.Auth{}) {
 			t.Errorf("UA=%q want desktop UA", r.Header.Get("User-Agent"))
 		}
 		raw, _ := io.ReadAll(r.Body)
@@ -111,7 +112,8 @@ func TestSetAppearanceTheme(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := &Client{HTTP: srv.Client(), ChatBaseCN: srv.URL}
+	c.HTTP = srv.Client()
+	c.ChatBaseCN = srv.URL
 	if err := c.SetAppearanceTheme(&auth.Auth{AccessToken: "at", UID: "u1"}, "theme-tkmw7j"); err != nil {
 		t.Fatalf("set theme: %v", err)
 	}

@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -274,7 +275,7 @@ func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
 		gotAuth = r.Header.Get("Authorization")
 		gotUID = r.Header.Get("X-User-Id")
 		gotProduct = r.Header.Get("X-Product")
-		gotBody, _ = io.ReadAll(r.Body)
+		gotBody = readRequestBody(t, r)
 		return &http.Response{
 			StatusCode: 200,
 			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
@@ -290,7 +291,7 @@ func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
 		t.Errorf("200 response should carry nil body, got %q", respBody)
 	}
 	rc.Close()
-	if gotAuth != "Bearer at" || gotUID != "u1" || gotProduct != "WorkBuddy" {
+	if gotAuth != "Bearer at" || gotUID != "u1" || gotProduct != "SaaS" {
 		t.Errorf("headers: auth=%q uid=%q product=%q", gotAuth, gotUID, gotProduct)
 	}
 	if !bytes.Contains(gotBody, []byte(`"stream":true`)) {
@@ -309,7 +310,7 @@ func TestFetchModelsEffortsDriveBodyDowngrade(t *testing.T) {
 		case strings.HasSuffix(r.URL.Path, "/v3/config"):
 			return jsonResp(200, `{"code":0,"data":{"models":[]}}`), nil
 		default:
-			outbound, _ = io.ReadAll(r.Body)
+			outbound = readRequestBody(t, r)
 			return &http.Response{
 				StatusCode: 200,
 				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
@@ -345,6 +346,24 @@ func TestFetchModelsEffortsDriveBodyDowngrade(t *testing.T) {
 	if got, _ := m["reasoning_effort"].(string); got != "high" {
 		t.Errorf("reasoning_effort=%v want high (outbound=%s)", m["reasoning_effort"], outbound)
 	}
+}
+
+func readRequestBody(t *testing.T, r *http.Request) []byte {
+	t.Helper()
+	var reader io.Reader = r.Body
+	if r.Header.Get("Content-Encoding") == "gzip" {
+		zr, err := gzip.NewReader(r.Body)
+		if err != nil {
+			t.Fatalf("gzip body: %v", err)
+		}
+		defer zr.Close()
+		reader = zr
+	}
+	raw, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return raw
 }
 
 func TestChatStreamHardCreditError(t *testing.T) {

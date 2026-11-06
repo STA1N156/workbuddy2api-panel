@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"io"
@@ -1395,7 +1396,7 @@ func TestContentBlockedTriggersDegradedRetry(t *testing.T) {
 	var bodies [][]byte
 	up := &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			raw, _ := io.ReadAll(r.Body)
+			raw := readUpstreamRequestBody(t, r)
 			bodies = append(bodies, raw)
 			// 首次（body 含原始 system）返回 400 内容拦截；后续返回 200。
 			if len(bodies) == 1 {
@@ -1536,7 +1537,7 @@ func TestCustomModeFingerprintSanitizePreserved(t *testing.T) {
 	var sentBody []byte
 	up := &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			raw, _ := io.ReadAll(r.Body)
+			raw := readUpstreamRequestBody(t, r)
 			sentBody = raw
 			return &http.Response{
 				StatusCode: 200,
@@ -1609,6 +1610,24 @@ func TestCustomModeFingerprintSanitizePreserved(t *testing.T) {
 	if systemCount != 1 {
 		t.Errorf("want exactly 1 system message, got %d (all=%v)", systemCount, msgs)
 	}
+}
+
+func readUpstreamRequestBody(t *testing.T, r *http.Request) []byte {
+	t.Helper()
+	var reader io.Reader = r.Body
+	if r.Header.Get("Content-Encoding") == "gzip" {
+		zr, err := gzip.NewReader(r.Body)
+		if err != nil {
+			t.Fatalf("gzip upstream body: %v", err)
+		}
+		defer zr.Close()
+		reader = zr
+	}
+	raw, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read upstream body: %v", err)
+	}
+	return raw
 }
 
 // --- 模型原生工具调用标记修复（端到端，见 upstream/dsml.go）-----------------

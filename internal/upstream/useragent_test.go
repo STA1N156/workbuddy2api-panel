@@ -3,6 +3,7 @@ package upstream
 import (
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -48,7 +49,7 @@ func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 			call: func(c *Client) error {
 				return c.ReportChatActivity(&auth.Auth{AccessToken: "at", UID: "u1"}, "cid", "")
 			},
-			wantUA: "WorkBuddy/5.5.4",
+			wantUA: "WorkBuddy/5.9.3",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -160,10 +161,10 @@ func TestFetchModelsUsesConfiguredUA(t *testing.T) {
 // --- A 段：UA 对齐官方 WorkBuddy 三段式 ---
 
 const (
-	defaultUAString      = "WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1"
+	defaultUAString      = "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0"
 	explicitString       = "MyCustomAgent/3.1"
-	clientVerUAString    = "WorkBuddy/6.0.0 WorkBuddy/6.0.0 CLI/2.137.1"
-	billingUAWorkBuddy   = "WorkBuddy/5.5.4"
+	clientVerUAString    = "WorkBuddy/6.0.0 WorkBuddy/6.0.0 CLI/2.165.0"
+	billingUAWorkBuddy   = "WorkBuddy/5.9.3"
 	billingUACustomVer   = "WorkBuddy/6.0.0"
 	billingUAAgentString = "BillingAgent/1"
 )
@@ -187,6 +188,71 @@ func TestUserAgentDefaultWorkBuddyShape(t *testing.T) {
 	}
 	if rc != nil {
 		rc.Close()
+	}
+}
+
+func TestChatHeadersCurrentOfficialIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		domain  string
+		wantUA  string
+		version string
+	}{
+		{
+			name:    "cn",
+			domain:  "www.workbuddy.cn",
+			wantUA:  "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0",
+			version: "5.9.3",
+		},
+		{
+			name:    "global",
+			domain:  "www.workbuddy.ai",
+			wantUA:  "WorkBuddy/5.9.4 WorkBuddy AI/5.9.4 CLI/2.165.0",
+			version: "5.9.4",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "https://example.test/v2/chat/completions", nil)
+			c := &Client{}
+			c.ChatHeaders(req, &auth.Auth{AccessToken: "at", UID: "u1", Domain: tc.domain}, "", ChatMeta{
+				ConversationID:        "conv-1",
+				ConversationRequestID: "0123456789abcdef0123456789abcdef",
+			})
+
+			for header, want := range map[string]string{
+				"User-Agent":                  tc.wantUA,
+				"X-Agent-Intent":              "craft",
+				"X-Agent-Purpose":             "conversation",
+				"X-Agent-Runtime":             "other",
+				"X-Agent-Type":                "main",
+				"X-IDE-Name":                  "WorkBuddy",
+				"X-IDE-Type":                  "WorkBuddy",
+				"X-IDE-Version":               tc.version,
+				"X-Private-Data":              "true",
+				"X-Product":                   "SaaS",
+				"x-stainless-lang":            "js",
+				"x-stainless-package-version": "6.25.0",
+				"x-stainless-runtime":         "node",
+				"x-stainless-runtime-version": "v22.21.1",
+			} {
+				if got := req.Header.Get(header); got != want {
+					t.Errorf("%s = %q want %q", header, got, want)
+				}
+			}
+			for _, header := range []string{"Origin", "Referer", "Accept-Language", "X-Machine-ID", "X-Session-ID"} {
+				if got := req.Header.Get(header); got != "" {
+					t.Errorf("%s = %q want omitted", header, got)
+				}
+			}
+			for _, header := range []string{"traceparent", "b3", "X-B3-ParentSpanId"} {
+				if got := req.Header.Get(header); got == "" {
+					t.Errorf("%s missing", header)
+				}
+			}
+			if got := req.Header.Get("acp-connection-id"); len(got) != 36 || strings.Count(got, "-") != 4 {
+				t.Errorf("acp-connection-id = %q want UUID", got)
+			}
+		})
 	}
 }
 
@@ -253,7 +319,7 @@ func TestUserAgentClientVersionOverride(t *testing.T) {
 // `WorkBuddy/<clientVersion>`（不带 CLI 段，对齐官方 banner/check-in 显式头组）。
 func TestBillingUA_WhenClientNameSet(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	// 默认 client_version → WorkBuddy/5.5.4
+	// 默认 client_version → WorkBuddy/5.9.3
 	c := &Client{
 		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
 			if got := r.Header.Get("User-Agent"); got != billingUAWorkBuddy {
@@ -323,12 +389,12 @@ func TestBillingUA_WhenClientNameEmpty(t *testing.T) {
 	if ua != "WorkBuddy/6.0.0" {
 		t.Errorf("billing UA = %q want WorkBuddy/6.0.0 (default desktop fingerprint)", ua)
 	}
-	if got := c.billingUA(); got != "WorkBuddy/6.0.0" {
+	if got := c.billingUA(a); got != "WorkBuddy/6.0.0" {
 		t.Errorf("billingUA() = %q want WorkBuddy/6.0.0", got)
 	}
 	// 显式 SaaS 还原旧行为（不设 UA）。
 	c.ClientName = "SaaS"
-	if got := c.billingUA(); got != "" {
+	if got := c.billingUA(a); got != "" {
 		t.Errorf("billingUA() SaaS = %q want empty", got)
 	}
 }

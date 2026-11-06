@@ -2,7 +2,6 @@ package upstream
 
 import (
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -255,7 +254,7 @@ func TestPrepareBodyDefaultSanitizes(t *testing.T) {
 func TestChatStreamWireBodySanitized(t *testing.T) {
 	var gotBody []byte
 	ts := newTestUpstream(t, func(w http.ResponseWriter, r *http.Request) {
-		gotBody, _ = io.ReadAll(r.Body)
+		gotBody = readRequestBody(t, r)
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"))
 	})
@@ -298,7 +297,7 @@ func TestChatStreamWireBodySanitized(t *testing.T) {
 func TestChatStreamWireBodyCodexInstructionsSanitized(t *testing.T) {
 	var gotBody []byte
 	ts := newTestUpstream(t, func(w http.ResponseWriter, r *http.Request) {
-		gotBody, _ = io.ReadAll(r.Body)
+		gotBody = readRequestBody(t, r)
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"))
 	})
@@ -342,7 +341,7 @@ func TestChatStreamWireBodyCodexInstructionsSanitized(t *testing.T) {
 func TestChatStreamWireBodySanitizeDisabled(t *testing.T) {
 	var gotBody []byte
 	ts := newTestUpstream(t, func(w http.ResponseWriter, r *http.Request) {
-		gotBody, _ = io.ReadAll(r.Body)
+		gotBody = readRequestBody(t, r)
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("data: [DONE]\n\n"))
 	})
