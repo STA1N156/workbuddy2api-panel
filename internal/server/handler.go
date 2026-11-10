@@ -244,6 +244,7 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 			"events_total": exploreEvents,
 			"per_model":    exploreLast,
 		},
+		"supports_account_uid": true,
 	})
 }
 
@@ -742,10 +743,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
-	for i := 0; i < h.cfg.MaxRotate; i++ {
+	// 管理巡检可指定账号；沿用正常转发和冷却规则，且不回落到其他账号。
+	targetUID := strings.TrimSpace(r.Header.Get("X-Account-UID"))
+	maxRotate := h.cfg.MaxRotate
+	if targetUID != "" {
+		maxRotate = 1
+		stickyUID = ""
+	}
+	for i := 0; i < maxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
-		if stickyUID != "" {
+		if targetUID != "" {
+			acct = h.cfg.Pool.PickByUIDForModel(targetUID, bareModel)
+			if acct == nil || (realm != "" && acct.Realm() != realm) {
+				writeOpenAIError(w, http.StatusServiceUnavailable, "account_unavailable", "target account is unavailable for this model")
+				st.status = http.StatusServiceUnavailable
+				return
+			}
+			w.Header().Set("X-Account-UID", acct.UID)
+		}
+		if acct == nil && stickyUID != "" {
 			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
 			if acct == nil || (realm != "" && acct.Realm() != realm) {
 				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑，
